@@ -19,7 +19,7 @@
  * device_id est généré localement à la 1ère activation.
  */
 
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
+import { copyFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -164,6 +164,69 @@ async function main() {
       && readFileSync(join(wsA, reverseName), "utf8") === reverseContent,
   )
   console.log(`[multidevice] ✓ A received "${reverseName}" from B`)
+
+  // ─── Scénario 5 : rename sur A → B voit le rename ──────────────────────
+  // NB chokidar : sur certains FS, fs.rename atomique ne génère pas
+  // unlink+add (juste un MOVED_FROM/TO de bas niveau). On utilise
+  // unlink + writeFile pour forcer 2 events distincts → le détecteur
+  // rename (engine.ts step 34) compare les hashes et enqueue op=rename.
+  console.log("\n[multidevice] === scenario 5 : rename on A ===")
+  const oldRenameName = "from-b.md"
+  const newRenameName = "renamed.md"
+  // Attendre que from-b.md (créé par pull entrant) soit stabilisé côté
+  // chokidar — sinon l'unlink immédiat est suppress par awaitWriteFinish.
+  await wait(1500)
+  const renameContent = readFileSync(join(wsA, oldRenameName))
+
+  const fsP = await import("node:fs/promises")
+  await fsP.unlink(join(wsA, oldRenameName))
+  await wait(200) // laisse passer unlink event dans la fenêtre 500ms du rename detector
+  await fsP.writeFile(join(wsA, newRenameName), renameContent)
+
+  await waitUntil(
+    `B sees ${newRenameName} present and ${oldRenameName} absent`,
+    () => existsSync(join(wsB, newRenameName))
+      && !existsSync(join(wsB, oldRenameName)),
+    15_000,
+  )
+  console.log(`[multidevice] ✓ B sees ${oldRenameName} → ${newRenameName}`)
+
+  // ─── Scénario 6 : conflit (local edit non-push + pull entrant) ─────────
+  console.log("\n[multidevice] === scenario 6 : conflict (concurrent edit) ===")
+  const conflictName = "conflict-test.md"
+  // A crée et propage à B
+  writeFileSync(join(wsA, conflictName), "original from A")
+  await waitUntil(
+    "B receives conflict-test.md",
+    () => existsSync(join(wsB, conflictName))
+      && readFileSync(join(wsB, conflictName), "utf8") === "original from A",
+  )
+
+  // B modifie localement SANS attendre — overwrite avant pull entrant
+  writeFileSync(join(wsB, conflictName), "B's local edit (not yet pushed)")
+  // Tout de suite après : A modifie aussi (réplique sur B via broadcast)
+  await wait(200)
+  writeFileSync(join(wsA, conflictName), "A's edit propagating to B")
+
+  // B doit avoir créé une conflict copy contenant son edit local non push.
+  // Le contenu final de conflict-test.md dépend du race serveur (last-write-
+  // wins par hash chronologique côté ②) — on ne s'engage pas dessus, le
+  // critère de succès est la NON-PERTE de données = la conflict copy existe.
+  // Polling sur l'existence + log du contenu pour diagnostic
+  await waitUntil(
+    "B has at least one conflict copy",
+    () => readdirSync(wsB).some((f) => f.startsWith("conflict-test.conflict-")),
+    15_000,
+  )
+  const dirEntries = readdirSync(wsB)
+  const conflictCopy = dirEntries.find((f) => f.startsWith("conflict-test.conflict-"))
+  const conflictContent = readFileSync(join(wsB, conflictCopy), "utf8")
+  console.log(`[multidevice] conflict copy "${conflictCopy}" contains: "${conflictContent}"`)
+  if (conflictContent !== "B's local edit (not yet pushed)") {
+    console.warn(`[multidevice] ⚠ conflict copy does not contain B's local edit (race condition possible)`)
+  } else {
+    console.log(`[multidevice] ✓ B's local edit preserved in conflict copy`)
+  }
 
   // ─── Cleanup ───────────────────────────────────────────────────────────
   console.log("\n[multidevice] deactivating both engines…")

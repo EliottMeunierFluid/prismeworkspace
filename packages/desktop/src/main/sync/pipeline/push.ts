@@ -180,16 +180,13 @@ async function pushRename(op: PendingOp, opts: PushPipelineOptions): Promise<boo
   const oldB64 = (await encryptPath(meta.old_path, opts.keys)).toString("base64")
   const newB64 = (await encryptPath(meta.new_path, opts.keys)).toString("base64")
 
-  // Le contract WS C5 (WsRenameMessage) ne déclare pas `uid`, mais le serveur ②
-  // le requiert (cf WsRenameSchema). On envoie quand même — TODO : aligner C5
-  // dans le crypto kit.
-  const renameMsg = {
-    op: "rename" as const,
+  const renameMsg: WsRenameMessage = {
+    op: "rename",
     uid: op.uid,
     old_path: oldB64,
     new_path: newB64,
     mtime: meta.mtime_ms,
-  } satisfies Omit<WsRenameMessage, never> & { uid: number }
+  }
 
   log.info("[sync/push] sending rename", {
     uid: op.uid,

@@ -153,19 +153,53 @@ export interface BootstrapOptions {
 /**
  * Lance le bootstrap : list + pulls pour tous les fichiers que le client n'a pas
  * déjà synchronisés.
+ *
+ * Étape 42 : si meta `last_bootstrap_version` est présent, on envoie
+ * `since_version=N` au serveur → liste incrémentale. Sinon (1ère sync),
+ * full list. Après le bootstrap, on persiste max(row_version) reçu.
  */
 export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapResult> {
   const result: BootstrapResult = { listed: 0, pulled: 0, skipped: 0, failed: 0 }
 
+  const sinceVersion = Number.parseInt(
+    opts.db.getMeta("last_bootstrap_version") ?? "0",
+    10,
+  )
+  log.info("[sync/bootstrap] starting", { sinceVersion })
+
   const waiter = opts.transport.beginBootstrap()
+  let maxRowVersion = sinceVersion
   try {
-    opts.transport.sendJson({ op: "list", uid: 0, since_version: 0 })
+    opts.transport.sendJson({ op: "list", uid: 0, since_version: sinceVersion })
     const items = await waiter.awaitListMeta()
     result.listed = items.length
     log.info("[sync/bootstrap] list_meta received", { count: items.length })
 
     let pullUid = 0
     for (const item of items) {
+      if (typeof item.row_version === "number" && item.row_version > maxRowVersion) {
+        maxRowVersion = item.row_version
+      }
+
+      // Cas delete : item.deleted=true (bootstrap incrémental ramène les
+      // deletes survenus depuis sinceVersion).
+      if (item.deleted) {
+        log.info("[sync/bootstrap] applying incremental delete", {
+          pathB64Prefix: item.path.slice(0, 16),
+        })
+        await opts.pullPipeline.handleInboundDelete({
+          pathB64: item.path,
+          hash: "",
+          size: 0,
+          pieces: 0,
+          deleted: true,
+          ctime: 0,
+          mtime: item.mtime,
+        })
+        result.skipped++
+        continue
+      }
+
       // Skip si on a déjà ce fichier avec le même hash (cas reconnexion)
       const knownByPathB64 = findServerFileByPathB64(opts.db, item.path)
       if (knownByPathB64 && knownByPathB64.hash === item.hash) {
@@ -182,9 +216,14 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
     opts.transport.endBootstrap()
   }
 
-  log.info("[sync/bootstrap] done", result)
+  // Persiste max row_version pour le prochain bootstrap incrémental
+  if (maxRowVersion > sinceVersion) {
+    opts.db.setMeta("last_bootstrap_version", String(maxRowVersion))
+  }
+  log.info("[sync/bootstrap] done", { ...result, newSinceVersion: maxRowVersion })
   return result
 }
+
 
 function findServerFileByPathB64(
   db: SyncStateDb,

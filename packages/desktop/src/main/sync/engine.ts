@@ -28,7 +28,7 @@ import type {
   WsInitMessage,
   WsReadyMessage,
 } from "@prisme/sync-crypto/contracts"
-import { CRYPTO_VERSION } from "./constants"
+import { CRYPTO_VERSION, PERIODIC_SWEEP_INTERVAL_MS } from "./constants"
 import {
   activateKeys,
   deactivateKeys,
@@ -53,8 +53,9 @@ import {
   type PushTransport,
   type PushWaiter,
 } from "./pipeline/push"
-import { stat as fsStat } from "node:fs/promises"
-import { join } from "node:path"
+import { stat as fsStat, mkdir, rename as fsRename } from "node:fs/promises"
+import { dirname, join, normalize, sep } from "node:path"
+import { decryptPath } from "@prisme/sync-crypto"
 import { openStateDb, type SyncStateDb } from "./state/db"
 import { hashFile, runInitialSweep, type SweepResult } from "./sweep"
 import { createRestClient } from "./transport/rest-client"
@@ -130,6 +131,8 @@ export class SyncEngine {
   private pullPipeline: PullPipeline | undefined
   /** Waiter actif pendant le bootstrap (Étape 38) — list_meta + pull_meta. */
   private activeBootstrapWaiter: BootstrapWaiter | undefined
+  /** Timer du sweep périodique safety-net (Étape 41). */
+  private periodicSweepTimer: NodeJS.Timeout | undefined
   /**
    * Étape 34 — détection rename. Un `unlink` est tenu en attente RENAME_WINDOW
    * ms ; si un `add` avec le même hash arrive entre-temps, on enqueue rename
@@ -338,6 +341,11 @@ export class SyncEngine {
             void this.handleInboundPush(data)
             return
           }
+          // Étape 40 — broadcast rename atomique d'un autre device.
+          if (data.op === "rename") {
+            void this.handleInboundRename(data)
+            return
+          }
           // Étape 38 — bootstrap responses
           if (data.op === "list_meta") {
             const items = Array.isArray(data.items) ? (data.items as unknown[]) : []
@@ -476,7 +484,34 @@ export class SyncEngine {
       })
       await this.watcher.ready()
     }
+
+    // Étape 41 : sweep périodique safety-net. Si le watcher rate un event
+    // (cas rare : surcharge OS, FUSE buggy, watcher crashé silencieusement),
+    // ce sweep rattrape en re-scannant le workspace toutes les 15 min.
+    // Idempotent : si rien n'a changé, 0 push enqueué.
+    this.startPeriodicSweep()
+
     return sweepResult
+  }
+
+  private startPeriodicSweep(): void {
+    if (this.periodicSweepTimer) return
+    this.periodicSweepTimer = setInterval(() => {
+      if (!this.workspaceRoot || !this.db) return
+      log.info("[sync] periodic sweep tick")
+      runInitialSweep(this.workspaceRoot, this.db)
+        .then((result) => {
+          if (result.pushed + result.deleted > 0) {
+            log.info("[sync] periodic sweep found drift", result)
+            void this.triggerDrain()
+          }
+        })
+        .catch((err) => {
+          log.warn("[sync] periodic sweep failed", {
+            err: err instanceof Error ? err.message : String(err),
+          })
+        })
+    }, PERIODIC_SWEEP_INTERVAL_MS)
   }
 
   /**
@@ -579,7 +614,9 @@ export class SyncEngine {
    * convertit l'op en rename. Sinon (timer expire) on enqueue le delete final.
    */
   private scheduleDeleteOrRename(path: string, hash: string): void {
-    const RENAME_WINDOW_MS = 500
+    // Fenêtre large : chokidar `awaitWriteFinish` peut espacer l'unlink et
+    // le add du fichier renommé de ~1s. On laisse 2s pour absorber.
+    const RENAME_WINDOW_MS = 2000
     const timer = setTimeout(() => {
       this.pendingUnlinks.delete(path)
       if (!this.db) return
@@ -639,6 +676,66 @@ export class SyncEngine {
   }
 
   /**
+   * Étape 40 : broadcast rename d'un autre device.
+   *   server → {op:'rename', old_path, new_path, mtime, device, vault_version}
+   * On rename le fichier local et update local_files/server_files.
+   */
+  private async handleInboundRename(msg: Record<string, unknown>): Promise<void> {
+    if (!this.workspaceRoot || !this.db || !this.vaultId) return
+    const oldB64 = typeof msg.old_path === "string" ? msg.old_path : ""
+    const newB64 = typeof msg.new_path === "string" ? msg.new_path : ""
+    if (!oldB64 || !newB64) {
+      log.warn("[sync/engine] inbound rename missing paths — dropped")
+      return
+    }
+    const keys = getActiveKeys(this.vaultId)
+    let oldPath: string
+    let newPath: string
+    try {
+      oldPath = await decryptPath(Buffer.from(oldB64, "base64"), keys)
+      newPath = await decryptPath(Buffer.from(newB64, "base64"), keys)
+    } catch (err) {
+      log.warn("[sync/engine] inbound rename decrypt failed", {
+        err: err instanceof Error ? err.message : String(err),
+      })
+      return
+    }
+    // SECURITY : pas de path traversal côté new_path
+    if (!isPathSafe(newPath) || !isPathSafe(oldPath)) {
+      log.warn("[sync/engine] inbound rename path traversal rejected", { oldPath, newPath })
+      return
+    }
+    const oldAbs = join(this.workspaceRoot, oldPath)
+    const newAbs = join(this.workspaceRoot, newPath)
+    try {
+      await mkdir(dirname(newAbs), { recursive: true })
+      await fsRename(oldAbs, newAbs)
+      log.info("[sync/engine] inbound rename applied", { oldPath, newPath })
+    } catch (err) {
+      // Si oldAbs n'existe pas (déjà renommé localement, ou jamais sync), on
+      // s'en fout — le local est dans un état imprévu mais pas de crash.
+      log.warn("[sync/engine] inbound rename fs failed (will sync via sweep)", {
+        oldPath, newPath,
+        err: err instanceof Error ? err.message : String(err),
+      })
+    }
+    // Update DB : déplace les entries
+    const oldLocal = this.db.getLocalFile(oldPath)
+    if (oldLocal) {
+      this.db.upsertLocalFile(newPath, oldLocal)
+      this.db.deleteLocalFile(oldPath)
+    }
+    const oldServer = this.db.getServerFile(oldPath)
+    if (oldServer) {
+      this.db.upsertServerFile(newPath, { ...oldServer, encrypted_path_b64: newB64 })
+      this.db.deleteServerFile(oldPath)
+    }
+    if (typeof msg.vault_version === "number") {
+      this.db.setMeta("last_known_version", String(msg.vault_version))
+    }
+  }
+
+  /**
    * Lance un drain du pipeline push si aucun n'est en cours. La méthode est
    * non-bloquante : l'appelant ne doit pas await (l'erreur de drain est
    * loguée mais n'arrête pas l'engine).
@@ -663,6 +760,10 @@ export class SyncEngine {
    */
   async deactivate(): Promise<void> {
     log.info("[sync] deactivate")
+    if (this.periodicSweepTimer) {
+      clearInterval(this.periodicSweepTimer)
+      this.periodicSweepTimer = undefined
+    }
     if (this.watcher) {
       await this.watcher.close()
       this.watcher = undefined
@@ -689,4 +790,12 @@ export class SyncEngine {
 
 function isObject(x: unknown): x is Record<string, unknown> {
   return typeof x === "object" && x !== null
+}
+
+/** Rejette les paths qui sortent du workspace (`..`, leading `/`, null bytes). */
+function isPathSafe(p: string): boolean {
+  if (!p) return false
+  const n = normalize(p)
+  if (n.startsWith("..") || n.startsWith(sep) || n.includes("\0")) return false
+  return true
 }
