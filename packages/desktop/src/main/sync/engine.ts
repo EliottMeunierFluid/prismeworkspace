@@ -51,6 +51,7 @@ import { stat as fsStat } from "node:fs/promises"
 import { join } from "node:path"
 import { openStateDb, type SyncStateDb } from "./state/db"
 import { hashFile, runInitialSweep, type SweepResult } from "./sweep"
+import { createRestClient } from "./transport/rest-client"
 import { createWsClient, type WsClient } from "./transport/ws-client"
 import { startFileWatcher, type FileWatcher, type FsEvent } from "./watcher"
 
@@ -59,8 +60,15 @@ export interface SyncConfig {
   workspaceRoot: string
   /** UUID du vault côté serveur (récupéré via /api/vaults). */
   vaultId: string
-  /** URL du serveur sync (ex: ws://localhost:3010/sync). */
-  wsUrl: string
+  /**
+   * Base URL du site SaaS ③ (ex: https://workspace.prisme.one ou
+   * http://localhost:3020). Si fourni, l'engine fetch le ws_url via
+   * `POST /api/vaults/:id/access`. Sinon, `wsUrl` doit être fourni.
+   */
+  siteUrl?: string
+  /** URL du serveur sync (ex: ws://localhost:3010/sync). Optionnel si siteUrl
+   *  est fourni — sera résolu via /api/vaults/:id/access. */
+  wsUrl?: string
   /** Bearer JWT obtenu via /api/auth/sync-token côté site SaaS. */
   syncToken: string
   /** Mot de passe E2EE du vault — utilisé une fois pour dériver les clés,
@@ -148,7 +156,8 @@ export class SyncEngine {
     log.info("[sync] activate requested", {
       workspaceRoot: config.workspaceRoot,
       vaultId: config.vaultId,
-      wsUrl: config.wsUrl,
+      wsUrl: config.wsUrl ?? "(via siteUrl)",
+      siteUrl: config.siteUrl,
       // SECURITY: pas de log de vaultPassword, syncToken, saltHex.
     })
     this.status = { state: "activating" }
@@ -180,13 +189,32 @@ export class SyncEngine {
     this.vaultId = config.vaultId
     this.workspaceRoot = config.workspaceRoot
 
-    // 4. Connexion WS + handshake init.
+    // 4. Résolution ws_url : soit fourni dans SyncConfig, soit fetché via
+    //    POST /api/vaults/:id/access côté site SaaS ③ (Étape 36).
+    let wsUrl = config.wsUrl
+    let serverVaultVersion = lastKnownVersion
+    if (!wsUrl) {
+      if (!config.siteUrl) {
+        this.status = {
+          state: "error",
+          message: "SyncConfig must provide either wsUrl or siteUrl",
+        }
+        throw new Error(this.status.message)
+      }
+      const rest = createRestClient({ baseUrl: config.siteUrl, syncToken: config.syncToken })
+      const access = await rest.getVaultAccess(config.vaultId, keyhashHex)
+      wsUrl = access.ws_url
+      serverVaultVersion = access.vault_version
+      log.info("[sync] access OK", { ws_url: wsUrl, vault_version: serverVaultVersion })
+    }
+
+    // 5. Connexion WS + handshake init.
     await this.connectAndHandshake({
-      wsUrl: config.wsUrl,
+      wsUrl,
       syncToken: config.syncToken,
       vaultId: config.vaultId,
       keyhashHex,
-      vaultVersion: lastKnownVersion,
+      vaultVersion: serverVaultVersion,
       initial,
       deviceId,
     })

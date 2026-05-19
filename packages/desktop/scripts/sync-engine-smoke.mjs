@@ -43,12 +43,16 @@ const DESKTOP_ROOT = resolve(__dirname_pre, "..")
 const SYNC_ENTRY = resolve(DESKTOP_ROOT, "src/main/sync/engine.ts")
 
 const ENV = process.env
-const required = ["SMOKE_VAULT_ID", "SMOKE_WS_URL", "SMOKE_SYNC_TOKEN", "SMOKE_VAULT_PASSWORD", "SMOKE_SALT_HEX"]
+const required = ["SMOKE_VAULT_ID", "SMOKE_SYNC_TOKEN", "SMOKE_VAULT_PASSWORD", "SMOKE_SALT_HEX"]
 for (const k of required) {
   if (!ENV[k]) {
     console.error(`[smoke] missing env: ${k}`)
     process.exit(2)
   }
+}
+if (!ENV.SMOKE_WS_URL && !ENV.SMOKE_SITE_URL) {
+  console.error("[smoke] missing env: either SMOKE_WS_URL or SMOKE_SITE_URL must be set")
+  process.exit(2)
 }
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -96,9 +100,12 @@ async function main() {
   const engine = new SyncEngine()
 
   console.log("[smoke] calling activate()…")
+  // Si SMOKE_SITE_URL est fourni, on laisse l'engine fetch ws_url via
+  // /api/vaults/:id/access (Étape 36). Sinon, SMOKE_WS_URL doit être direct.
   await engine.activate({
     workspaceRoot,
     vaultId: ENV.SMOKE_VAULT_ID,
+    siteUrl: ENV.SMOKE_SITE_URL,
     wsUrl: ENV.SMOKE_WS_URL,
     syncToken: ENV.SMOKE_SYNC_TOKEN,
     vaultPassword: ENV.SMOKE_VAULT_PASSWORD,

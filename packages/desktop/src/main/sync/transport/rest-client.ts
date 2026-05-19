@@ -7,14 +7,9 @@
  * Le sync_token JWT (HS256, TTL 1h) est obtenu côté renderer via NextAuth ;
  * il est passé ici en input — pas de gestion de session côté main.
  *
- * Endpoints utilisés en Session A :
- *   - POST /api/vaults : créer un vault (caller doit gérer l'idempotence —
- *     si vault déjà existant côté serveur, ne pas re-créer).
- *
- * NB Session A : `/api/vaults/:id/access` n'est PAS encore implémenté côté ③
- * (cf workspace-prisme-one). Le `ws_url` est passé directement à
- * SyncEngine.activate() via SyncConfig.wsUrl pour l'instant. À factoriser en
- * Session B quand l'endpoint sera disponible.
+ * Endpoints utilisés :
+ *   - POST /api/vaults                 : créer un vault
+ *   - POST /api/vaults/:id/access      : valide keyhash, retourne ws_url
  *
  * SECURITY : les erreurs HTTP ne doivent PAS contenir le sync_token. On log
  * le code HTTP + corps si non-2xx, mais jamais les headers d'auth.
@@ -23,6 +18,7 @@
 import log from "electron-log"
 import type {
   Vault,
+  VaultAccessResponse,
   VaultCreateRequest,
 } from "@prisme/sync-crypto/contracts"
 
@@ -35,6 +31,12 @@ export interface RestClientOptions {
 
 export interface RestClient {
   createVault: (req: VaultCreateRequest) => Promise<Vault>
+  /**
+   * Demande à ③ l'URL du serveur sync ② pour ce vault, après vérification
+   * keyhash (preuve de possession). Retourne 403 INVALID_KEYHASH si mauvais
+   * password.
+   */
+  getVaultAccess: (vaultId: string, keyhashHex: string) => Promise<VaultAccessResponse>
 }
 
 export function createRestClient(opts: RestClientOptions): RestClient {
@@ -70,5 +72,11 @@ export function createRestClient(opts: RestClientOptions): RestClient {
 
   return {
     createVault: (req) => request<Vault>("POST", "/api/vaults", req),
+    getVaultAccess: (vaultId, keyhashHex) =>
+      request<VaultAccessResponse>(
+        "POST",
+        `/api/vaults/${encodeURIComponent(vaultId)}/access`,
+        { keyhash: keyhashHex },
+      ),
   }
 }
