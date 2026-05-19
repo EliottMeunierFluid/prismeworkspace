@@ -31,6 +31,8 @@ export interface FsEvent {
 }
 
 export interface FileWatcher {
+  /** Résout dès que le watcher a fini son scan initial (avant les events). */
+  ready: () => Promise<void>
   /** Ferme le watcher. Idempotent. */
   close: () => Promise<void>
 }
@@ -89,8 +91,16 @@ export function startFileWatcher(opts: FileWatcherOptions): FileWatcher {
     log.warn("[sync/watcher] error", { message: msg })
   })
 
+  const readyPromise = new Promise<void>((resolve) => {
+    watcher.once("ready", () => {
+      log.info("[sync/watcher] ready (initial scan done)")
+      resolve()
+    })
+  })
+
   let closed = false
   return {
+    ready: () => readyPromise,
     close: async () => {
       if (closed) return
       closed = true

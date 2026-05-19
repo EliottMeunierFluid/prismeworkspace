@@ -15,3 +15,4 @@
 
 export { SyncEngine } from "./engine"
 export type { SyncConfig, SyncStatus } from "./engine"
+export { registerSyncIpcHandlers, shutdownSync } from "./ipc"

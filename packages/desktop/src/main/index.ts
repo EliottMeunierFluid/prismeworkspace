@@ -48,6 +48,7 @@ import { initLogging } from "./logging"
 import { parseMarkdown } from "./markdown"
 import { createMenu } from "./menu"
 import { getDefaultServerUrl, getWslConfig, setDefaultServerUrl, setWslConfig, spawnLocalServer } from "./server"
+import { registerSyncIpcHandlers, shutdownSync } from "./sync"
 import {
   createLoadingWindow,
   createMainWindow,
@@ -124,10 +125,12 @@ function setupApp() {
 
   app.on("before-quit", () => {
     killSidecar()
+    void shutdownSync()
   })
 
   app.on("will-quit", () => {
     killSidecar()
+    void shutdownSync()
   })
 
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
@@ -313,6 +316,8 @@ registerIpcHandlers({
   installUpdate: async () => installUpdate(),
   setBackgroundColor: (color) => setBackgroundColor(color),
 })
+
+registerSyncIpcHandlers()
 
 function killSidecar() {
   if (!server) return
