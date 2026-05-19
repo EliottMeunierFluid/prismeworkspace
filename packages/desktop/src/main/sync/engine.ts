@@ -36,6 +36,11 @@ import {
   hasActiveKeys,
 } from "./keys"
 import {
+  createPullPipeline,
+  type InboundPushMeta,
+  type PullPipeline,
+} from "./pipeline/pull"
+import {
   createPushPipeline,
   createPushWaiter,
   type PushPipeline,
@@ -107,6 +112,8 @@ export class SyncEngine {
   private activePushWaiter: PushWaiter | undefined
   /** Empêche les drains concurrents — la queue est FIFO, 1 worker suffit. */
   private drainInFlight = false
+  /** Pipeline pull (Étape 33) — réception broadcasts multi-device. */
+  private pullPipeline: PullPipeline | undefined
 
   getStatus(): SyncStatus {
     return this.status
@@ -271,16 +278,31 @@ export class SyncEngine {
             this.activePushWaiter?.onOk(vv)
             return
           }
-          // Les opcodes pull (pull_meta, …) seront gérés en Étape 33.
+          // Étape 33 — broadcast multi-device : un AUTRE device a push.
+          // Le serveur filtre nos propres pushs (except_device_id), donc tout
+          // {op:"push"} reçu vient d'un autre device.
+          if (data.op === "push") {
+            void this.handleInboundPush(data)
+            return
+          }
           log.info("[sync/engine] received op", { op: data.op })
         },
         onBinary: (chunk) => {
-          // Session A : pas de pull en place. On accepte mais on ignore.
-          log.info("[sync/engine] binary message ignored (Session A)", { bytes: chunk.length })
+          // Étape 33 — chunk binaire = part d'un broadcast inbound.
+          if (this.pullPipeline?.isReceiving()) {
+            void this.pullPipeline.appendBinaryChunk(chunk)
+            return
+          }
+          log.warn("[sync/engine] binary message without active inbound — ignored", {
+            bytes: chunk.length,
+          })
         },
         onClose: (code, reason) => {
           // Si un push est en vol, on le débloque pour libérer le drain.
           this.activePushWaiter?.onClose()
+          // Reset l'inbound en cours — les chunks éventuellement reçus sont
+          // corrompus si la connexion a coupé au milieu.
+          this.pullPipeline?.reset()
           if (settled) {
             // Fermeture après ready — passage en disconnected, le reconnect
             // est géré par le ws-client. Le re-handshake init après reconnect
@@ -332,6 +354,11 @@ export class SyncEngine {
       db: this.db,
       keys,
       transport,
+    })
+    this.pullPipeline = createPullPipeline({
+      workspaceRoot: this.workspaceRoot,
+      db: this.db,
+      keys,
     })
     await this.pushPipeline.drain()
 
@@ -425,6 +452,35 @@ export class SyncEngine {
   }
 
   /**
+   * Étape 33 : traite un message {op:"push"} reçu = broadcast d'un autre
+   * device. Le serveur filtre nos propres pushs via except_device_id, donc
+   * tout ce qui arrive ici vient d'ailleurs.
+   */
+  private async handleInboundPush(msg: Record<string, unknown>): Promise<void> {
+    if (!this.pullPipeline) return
+    const meta: InboundPushMeta = {
+      pathB64: typeof msg.path === "string" ? msg.path : "",
+      hash: typeof msg.hash === "string" ? msg.hash : "",
+      size: typeof msg.size === "number" ? msg.size : 0,
+      pieces: typeof msg.pieces === "number" ? msg.pieces : 0,
+      deleted: msg.deleted === true,
+      ctime: typeof msg.ctime === "number" ? msg.ctime : 0,
+      mtime: typeof msg.mtime === "number" ? msg.mtime : Date.now(),
+      device: typeof msg.device === "string" ? msg.device : undefined,
+      vaultVersion: typeof msg.vault_version === "number" ? msg.vault_version : undefined,
+    }
+    if (!meta.pathB64) {
+      log.warn("[sync/engine] inbound push missing path — dropped")
+      return
+    }
+    if (meta.deleted) {
+      await this.pullPipeline.handleInboundDelete(meta)
+      return
+    }
+    this.pullPipeline.beginInbound(meta)
+  }
+
+  /**
    * Lance un drain du pipeline push si aucun n'est en cours. La méthode est
    * non-bloquante : l'appelant ne doit pas await (l'erreur de drain est
    * loguée mais n'arrête pas l'engine).
@@ -464,6 +520,8 @@ export class SyncEngine {
     this.pushPipeline = undefined
     this.activePushWaiter = undefined
     this.drainInFlight = false
+    this.pullPipeline?.reset()
+    this.pullPipeline = undefined
     this.status = { state: "idle" }
   }
 }
