@@ -42,10 +42,12 @@ import {
   type PushTransport,
   type PushWaiter,
 } from "./pipeline/push"
+import { stat as fsStat } from "node:fs/promises"
+import { join } from "node:path"
 import { openStateDb, type SyncStateDb } from "./state/db"
-import { runInitialSweep, type SweepResult } from "./sweep"
+import { hashFile, runInitialSweep, type SweepResult } from "./sweep"
 import { createWsClient, type WsClient } from "./transport/ws-client"
-import { startFileWatcher, type FileWatcher } from "./watcher"
+import { startFileWatcher, type FileWatcher, type FsEvent } from "./watcher"
 
 export interface SyncConfig {
   /** Chemin absolu du workspace (dossier racine que l'utilisateur veut sync). */
@@ -103,6 +105,8 @@ export class SyncEngine {
   private pushPipeline: PushPipeline | undefined
   /** Waiter actif pour le push courant — 1 à la fois (drain séquentiel). */
   private activePushWaiter: PushWaiter | undefined
+  /** Empêche les drains concurrents — la queue est FIFO, 1 worker suffit. */
+  private drainInFlight = false
 
   getStatus(): SyncStatus {
     return this.status
@@ -335,14 +339,108 @@ export class SyncEngine {
       this.watcher = startFileWatcher({
         workspaceRoot: this.workspaceRoot,
         onEvent: (event) => {
-          // Étape 32 branchera enqueue + drain push ici. Pour l'instant,
-          // les events sont logués par le watcher lui-même.
-          void event
+          // Étape 32 : hash + enqueue + drain (non-bloquant).
+          void this.handleFsEvent(event)
         },
       })
       await this.watcher.ready()
     }
     return sweepResult
+  }
+
+  /**
+   * Étape 32 : traite un event fs et déclenche le drain push.
+   *
+   * - add / change : hash, skip si identique au cache, enqueue push + drain
+   * - unlink : enqueue delete + drain
+   * - addDir / unlinkDir : ignorés en v1 (folders pas push individuels)
+   *
+   * Erreurs silencieuses (warn) : si le fichier disparaît entre l'event et
+   * le hash, le pipeline traitera ça comme un delete au moment du drain.
+   */
+  private async handleFsEvent(event: FsEvent): Promise<void> {
+    if (!this.db || !this.workspaceRoot) return
+    if (event.kind === "addDir" || event.kind === "unlinkDir") return
+
+    if (event.kind === "unlink") {
+      const cached = this.db.getLocalFile(event.path)
+      if (!cached || cached.is_folder) return
+      this.db.enqueuePending(
+        event.path,
+        "delete",
+        JSON.stringify({ hash: cached.hash, mtime_ms: Date.now() }),
+      )
+      this.db.deleteLocalFile(event.path)
+      void this.triggerDrain()
+      return
+    }
+
+    // add / change : on hash et compare au cache pour éviter les push inutiles
+    const absPath = join(this.workspaceRoot, event.path)
+    let st
+    try {
+      st = await fsStat(absPath)
+    } catch (err) {
+      log.warn("[sync/engine] stat failed (race ?)", {
+        path: event.path,
+        err: err instanceof Error ? err.message : String(err),
+      })
+      return
+    }
+    if (!st.isFile()) return
+
+    let hash: string
+    try {
+      hash = await hashFile(absPath)
+    } catch (err) {
+      log.warn("[sync/engine] hash failed (race ?)", {
+        path: event.path,
+        err: err instanceof Error ? err.message : String(err),
+      })
+      return
+    }
+
+    const cached = this.db.getLocalFile(event.path)
+    if (cached && cached.hash === hash) return // pas de vrai changement
+
+    const data = {
+      hash,
+      size: st.size,
+      mtime_ms: Math.floor(st.mtimeMs),
+      ctime_ms: Math.floor(st.ctimeMs),
+      is_folder: false,
+    }
+    this.db.upsertLocalFile(event.path, data)
+    this.db.enqueuePending(
+      event.path,
+      "push",
+      JSON.stringify({
+        hash: data.hash,
+        size: data.size,
+        mtime_ms: data.mtime_ms,
+        ctime_ms: data.ctime_ms,
+      }),
+    )
+    void this.triggerDrain()
+  }
+
+  /**
+   * Lance un drain du pipeline push si aucun n'est en cours. La méthode est
+   * non-bloquante : l'appelant ne doit pas await (l'erreur de drain est
+   * loguée mais n'arrête pas l'engine).
+   */
+  private async triggerDrain(): Promise<void> {
+    if (this.drainInFlight || !this.pushPipeline) return
+    this.drainInFlight = true
+    try {
+      await this.pushPipeline.drain()
+    } catch (err) {
+      log.warn("[sync/engine] drain error", {
+        err: err instanceof Error ? err.message : String(err),
+      })
+    } finally {
+      this.drainInFlight = false
+    }
   }
 
   /**
@@ -365,6 +463,7 @@ export class SyncEngine {
     this.initialSyncPromise = undefined
     this.pushPipeline = undefined
     this.activePushWaiter = undefined
+    this.drainInFlight = false
     this.status = { state: "idle" }
   }
 }

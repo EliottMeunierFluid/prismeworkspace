@@ -59,8 +59,9 @@ function isIgnored(relativeSlashPath: string): boolean {
 
 /**
  * Hash SHA-256 d'un fichier en streaming (pas de chargement RAM complet).
+ * Exporté pour réutilisation par le watcher (Étape 32).
  */
-async function hashFile(absolutePath: string): Promise<string> {
+export async function hashFile(absolutePath: string): Promise<string> {
   const h = createHash("sha256")
   const stream = createReadStream(absolutePath, { highWaterMark: 64 * 1024 })
   return new Promise<string>((resolve, reject) => {
