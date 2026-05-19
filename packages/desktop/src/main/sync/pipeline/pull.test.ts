@@ -1,7 +1,12 @@
+import { createHash } from "node:crypto"
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+
+function createHashHex(content: string): string {
+  return createHash("sha256").update(content).digest("hex")
+}
 
 import {
   deriveVaultKeys,
@@ -187,6 +192,64 @@ describe("sync pull pipeline", () => {
     // Aucun beginInbound → on append
     await pipeline.appendBinaryChunk(Buffer.from("orphan"))
     expect(pipeline.isReceiving()).toBe(false)
+  })
+
+  test("conflict copy : local édité avant pull → préservation .conflict-*", async () => {
+    // Pré-état : fichier "v1" déjà sync (local_files + server_files)
+    writeFileSync(join(dir, "note.md"), "v1 from server")
+    db.upsertLocalFile("note.md", {
+      hash: createHashHex("v1 from server"),
+      size: 15,
+      mtime_ms: 100,
+      ctime_ms: 50,
+      is_folder: false,
+    })
+    db.upsertServerFile("note.md", {
+      hash: "fakeServerHash",
+      size: 50,
+      mtime_ms: 100,
+      encrypted_path_b64: "x",
+      pieces: 1,
+    })
+
+    // L'utilisateur édite localement (pas encore push) — devient "v1 + local edits"
+    writeFileSync(join(dir, "note.md"), "v1 + local edits")
+
+    // Un autre device push "v2 from other" → on reçoit le broadcast
+    const pipeline = createPullPipeline({ workspaceRoot: dir, db, keys })
+    const { meta, chunks } = await buildPushMessageFor("note.md", "v2 from other", keys)
+    pipeline.beginInbound({ ...meta, device: "other-device" })
+    await pipeline.appendBinaryChunk(chunks[0])
+
+    // Le contenu remote doit être écrit au path original
+    expect(readFileSync(join(dir, "note.md"), "utf8")).toBe("v2 from other")
+
+    // Et le contenu local doit être préservé en conflict copy
+    const entries = require("node:fs").readdirSync(dir)
+    const conflictCopy = entries.find((f: string) => f.startsWith("note.conflict-"))
+    expect(conflictCopy).toBeDefined()
+    const conflictContent = readFileSync(join(dir, conflictCopy!), "utf8")
+    expect(conflictContent).toBe("v1 + local edits")
+  })
+
+  test("pas de conflict copy si onDisk == remote", async () => {
+    // Cas : pull arrive mais on a déjà le contenu remote (ex: 2 devices push
+    // en parallèle exactement le même contenu)
+    writeFileSync(join(dir, "same.md"), "identical content")
+    db.upsertLocalFile("same.md", {
+      hash: createHashHex("identical content"),
+      size: 18, mtime_ms: 1, ctime_ms: 1, is_folder: false,
+    })
+
+    const pipeline = createPullPipeline({ workspaceRoot: dir, db, keys })
+    const { meta, chunks } = await buildPushMessageFor("same.md", "identical content", keys)
+    pipeline.beginInbound(meta)
+    await pipeline.appendBinaryChunk(chunks[0])
+
+    // Pas de conflict copy attendue
+    const entries = require("node:fs").readdirSync(dir)
+    const conflictCopy = entries.find((f: string) => f.startsWith("same.conflict-"))
+    expect(conflictCopy).toBeUndefined()
   })
 
   test("reset() interrompt un inbound en cours", async () => {

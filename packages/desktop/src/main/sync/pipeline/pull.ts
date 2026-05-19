@@ -22,8 +22,8 @@
  */
 
 import { createHash } from "node:crypto"
-import { mkdir, rename, rm, writeFile } from "node:fs/promises"
-import { dirname, join, normalize, relative, sep } from "node:path"
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
+import { dirname, extname, join, normalize, relative, sep } from "node:path"
 import { decryptContentChunked, decryptPath, type VaultKeys } from "@prisme/sync-crypto"
 import log from "electron-log"
 import type { LocalFileData, ServerFileData, SyncStateDb } from "../state/db"
@@ -137,11 +137,35 @@ async function finalizeInbound(s: PullState, opts: PullPipelineOptions): Promise
     const plaintext = await decryptContentChunked(s.receivedChunks, opts.keys)
     const absPath = join(opts.workspaceRoot, path)
     await mkdir(dirname(absPath), { recursive: true })
+
+    // ─── Étape 39 : détection conflit ───────────────────────────────────
+    // On a un conflit si le fichier existe localement avec un contenu
+    // différent du dernier état serveur connu (server_files[path].hash).
+    // Cela signifie que l'utilisateur a édité localement sans avoir
+    // encore push. Sans gestion, atomicWrite écraserait son travail.
+    //
+    // Stratégie v1 : conflict copy (sauf si le local matche déjà le remote
+    // = pas de vraie divergence). Le local est sauvegardé sous
+    // `<path>.conflict-<device>-<ISO>.<ext>` avant écrasement.
+    const remoteHash = sha256Hex(plaintext)
+    const conflictDetected = await detectLocalConflict(absPath, opts, path, remoteHash)
+    if (conflictDetected) {
+      const conflictPath = await preserveLocalAsConflictCopy(
+        absPath,
+        s.meta.device ?? "remote",
+      )
+      log.warn("[sync/pull] conflict detected — local saved as copy", {
+        path,
+        conflictCopy: relative(opts.workspaceRoot, conflictPath),
+      })
+    }
+
     await atomicWrite(absPath, plaintext)
     log.info("[sync/pull] inbound write OK", {
       path,
       bytes: plaintext.length,
       device: s.meta.device,
+      conflict: conflictDetected,
     })
 
     const localData: LocalFileData = {
@@ -173,6 +197,57 @@ async function finalizeInbound(s: PullState, opts: PullPipelineOptions): Promise
     })
   }
   s.meta.onComplete?.(ok)
+}
+
+/**
+ * Détecte si l'écriture du remote effacerait des modifs locales non push.
+ *
+ * Retourne true si :
+ *   - le fichier existe sur disque ET
+ *   - son hash diffère de server_files[path].hash (= ce qu'on a sync la
+ *     dernière fois) ET
+ *   - son hash diffère AUSSI du remote qu'on s'apprête à écrire (sinon
+ *     pas de vraie divergence, juste un fichier déjà à jour)
+ */
+async function detectLocalConflict(
+  absPath: string,
+  opts: PullPipelineOptions,
+  relPath: string,
+  remoteHash: string,
+): Promise<boolean> {
+  let onDisk: Buffer
+  try {
+    const st = await stat(absPath)
+    if (!st.isFile()) return false
+    onDisk = await readFile(absPath)
+  } catch {
+    return false // fichier absent → pas de conflit
+  }
+  const onDiskHash = sha256Hex(onDisk)
+  // Si le local matche déjà le remote → pas de divergence, pas de conflit.
+  if (onDiskHash === remoteHash) return false
+  // Le hash local cache (= ce qu'on avait sync la dernière fois) doit
+  // matcher le contenu disque. Sinon = modif locale non push = conflit.
+  const cachedLocal = opts.db.getLocalFile(relPath)
+  if (!cachedLocal) return true // jamais sync → conservatif : conflict copy
+  return cachedLocal.hash !== onDiskHash
+}
+
+/**
+ * Renomme le fichier local en conflict copy "<path>.conflict-<device>-<ISO>.<ext>"
+ * pour préserver le travail de l'utilisateur avant écrasement par le remote.
+ */
+async function preserveLocalAsConflictCopy(
+  absPath: string,
+  device: string,
+): Promise<string> {
+  const ext = extname(absPath)
+  const base = absPath.slice(0, absPath.length - ext.length)
+  const safeDevice = device.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 12)
+  const iso = new Date().toISOString().replace(/[:.]/g, "-")
+  const conflictPath = `${base}.conflict-${safeDevice}-${iso}${ext}`
+  await rename(absPath, conflictPath)
+  return conflictPath
 }
 
 /**
