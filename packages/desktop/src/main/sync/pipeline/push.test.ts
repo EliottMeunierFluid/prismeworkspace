@@ -230,6 +230,45 @@ describe("sync push pipeline", () => {
     expect(db.listPending().length).toBe(2)
   })
 
+  test("rename : envoie {op:rename} + transfère server_files", async () => {
+    // Pré-état : un fichier connu côté server_files au vieux path
+    db.upsertLocalFile("old.md", {
+      hash: "h", size: 5, mtime_ms: 100, ctime_ms: 50, is_folder: false,
+    })
+    db.upsertServerFile("old.md", {
+      hash: "h", size: 5, mtime_ms: 100,
+      encrypted_path_b64: "AAAA", pieces: 1,
+    })
+    db.enqueuePending(
+      "old.md",
+      "rename",
+      JSON.stringify({ old_path: "old.md", new_path: "new.md", mtime_ms: 200 }),
+    )
+
+    const fake = makeFakeTransport()
+    const pipeline = createPushPipeline({
+      workspaceRoot: dir, db, keys, transport: fake.transport,
+    })
+
+    const drainPromise = pipeline.drain()
+    await new Promise((r) => setTimeout(r, 10))
+    fake.ok(44)
+    const result = await drainPromise
+
+    expect(result.processed).toBe(1)
+    const jsonMsgs = fake.sent.filter((s) => s.kind === "json")
+    expect(jsonMsgs.length).toBe(1)
+    const msg = jsonMsgs[0].data as Record<string, unknown>
+    expect(msg.op).toBe("rename")
+    expect(typeof msg.old_path).toBe("string")
+    expect(typeof msg.new_path).toBe("string")
+    expect(msg.old_path).not.toBe(msg.new_path)
+
+    expect(db.getServerFile("old.md")).toBeUndefined()
+    expect(db.getServerFile("new.md")).toBeDefined()
+    expect(db.getMeta("last_known_version")).toBe("44")
+  })
+
   test("drain vide : no-op", async () => {
     const fake = makeFakeTransport()
     const pipeline = createPushPipeline({

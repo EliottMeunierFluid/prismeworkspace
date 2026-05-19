@@ -35,7 +35,7 @@ import {
   payloadHash,
   type VaultKeys,
 } from "@prisme/sync-crypto"
-import type { WsPushMessage } from "@prisme/sync-crypto/contracts"
+import type { WsPushMessage, WsRenameMessage } from "@prisme/sync-crypto/contracts"
 import log from "electron-log"
 import type { PendingOp, ServerFileData, SyncStateDb } from "../state/db"
 
@@ -164,9 +164,68 @@ export function createPushPipeline(opts: PushPipelineOptions): PushPipeline {
 async function pushOne(op: PendingOp, opts: PushPipelineOptions): Promise<boolean> {
   if (op.op === "push") return await pushFile(op, opts)
   if (op.op === "delete") return await pushDelete(op, opts)
-  log.warn("[sync/push] unsupported op (will retry later)", { op: op.op, uid: op.uid })
-  // rename = Étape 34
+  if (op.op === "rename") return await pushRename(op, opts)
+  log.warn("[sync/push] unsupported op", { op: op.op, uid: op.uid })
   return false
+}
+
+interface RenamePayload {
+  old_path: string
+  new_path: string
+  mtime_ms: number
+}
+
+async function pushRename(op: PendingOp, opts: PushPipelineOptions): Promise<boolean> {
+  const meta = JSON.parse(op.data) as RenamePayload
+  const oldB64 = (await encryptPath(meta.old_path, opts.keys)).toString("base64")
+  const newB64 = (await encryptPath(meta.new_path, opts.keys)).toString("base64")
+
+  // Le contract WS C5 (WsRenameMessage) ne déclare pas `uid`, mais le serveur ②
+  // le requiert (cf WsRenameSchema). On envoie quand même — TODO : aligner C5
+  // dans le crypto kit.
+  const renameMsg = {
+    op: "rename" as const,
+    uid: op.uid,
+    old_path: oldB64,
+    new_path: newB64,
+    mtime: meta.mtime_ms,
+  } satisfies Omit<WsRenameMessage, never> & { uid: number }
+
+  log.info("[sync/push] sending rename", {
+    uid: op.uid,
+    old_path: meta.old_path,
+    new_path: meta.new_path,
+  })
+  const waiter = opts.transport.beginPush()
+  try {
+    opts.transport.sendJson(renameMsg)
+    const okResult = await waiter.awaitOk()
+    log.info("[sync/push] rename ok", { uid: op.uid, vault_version: okResult.vaultVersion })
+
+    // Update local state : déplace l'entry dans local_files + server_files
+    const oldLocal = opts.db.getLocalFile(meta.old_path)
+    if (oldLocal) {
+      opts.db.upsertLocalFile(meta.new_path, oldLocal)
+      opts.db.deleteLocalFile(meta.old_path)
+    }
+    const oldServer = opts.db.getServerFile(meta.old_path)
+    if (oldServer) {
+      opts.db.upsertServerFile(meta.new_path, { ...oldServer, encrypted_path_b64: newB64 })
+      opts.db.deleteServerFile(meta.old_path)
+    }
+    if (okResult.vaultVersion !== undefined) {
+      opts.db.setMeta("last_known_version", String(okResult.vaultVersion))
+    }
+    return true
+  } catch (err) {
+    log.warn("[sync/push] rename failed", {
+      uid: op.uid,
+      err: err instanceof Error ? err.message : String(err),
+    })
+    return false
+  } finally {
+    opts.transport.endPush()
+  }
 }
 
 async function pushFile(op: PendingOp, opts: PushPipelineOptions): Promise<boolean> {

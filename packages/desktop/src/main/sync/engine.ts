@@ -114,6 +114,12 @@ export class SyncEngine {
   private drainInFlight = false
   /** Pipeline pull (Étape 33) — réception broadcasts multi-device. */
   private pullPipeline: PullPipeline | undefined
+  /**
+   * Étape 34 — détection rename. Un `unlink` est tenu en attente RENAME_WINDOW
+   * ms ; si un `add` avec le même hash arrive entre-temps, on enqueue rename
+   * au lieu de delete + push.
+   */
+  private pendingUnlinks: Map<string, { hash: string; timer: NodeJS.Timeout }> = new Map()
 
   getStatus(): SyncStatus {
     return this.status
@@ -392,13 +398,9 @@ export class SyncEngine {
     if (event.kind === "unlink") {
       const cached = this.db.getLocalFile(event.path)
       if (!cached || cached.is_folder) return
-      this.db.enqueuePending(
-        event.path,
-        "delete",
-        JSON.stringify({ hash: cached.hash, mtime_ms: Date.now() }),
-      )
-      this.db.deleteLocalFile(event.path)
-      void this.triggerDrain()
+      // Étape 34 : on retarde l'enqueue delete pour laisser passer un éventuel
+      // `add` (avec même hash) qui révèlerait un rename utilisateur.
+      this.scheduleDeleteOrRename(event.path, cached.hash)
       return
     }
 
@@ -427,6 +429,28 @@ export class SyncEngine {
       return
     }
 
+    // Étape 34 : si un unlink récent a le même hash → c'est un rename.
+    const renameOldPath = this.popPendingUnlinkByHash(hash)
+    if (renameOldPath) {
+      log.info("[sync/engine] rename detected", { old: renameOldPath, new: event.path })
+      const oldData = this.db.getLocalFile(renameOldPath)
+      if (oldData) {
+        this.db.upsertLocalFile(event.path, oldData)
+        this.db.deleteLocalFile(renameOldPath)
+      }
+      this.db.enqueuePending(
+        renameOldPath,
+        "rename",
+        JSON.stringify({
+          old_path: renameOldPath,
+          new_path: event.path,
+          mtime_ms: Math.floor(st.mtimeMs),
+        }),
+      )
+      void this.triggerDrain()
+      return
+    }
+
     const cached = this.db.getLocalFile(event.path)
     if (cached && cached.hash === hash) return // pas de vrai changement
 
@@ -449,6 +473,42 @@ export class SyncEngine {
       }),
     )
     void this.triggerDrain()
+  }
+
+  /**
+   * Étape 34 : retarde le delete d'un fichier. Si dans RENAME_WINDOW_MS un
+   * `add` arrive avec le même hash, popPendingUnlinkByHash le récupère et
+   * convertit l'op en rename. Sinon (timer expire) on enqueue le delete final.
+   */
+  private scheduleDeleteOrRename(path: string, hash: string): void {
+    const RENAME_WINDOW_MS = 500
+    const timer = setTimeout(() => {
+      this.pendingUnlinks.delete(path)
+      if (!this.db) return
+      this.db.enqueuePending(
+        path,
+        "delete",
+        JSON.stringify({ hash, mtime_ms: Date.now() }),
+      )
+      this.db.deleteLocalFile(path)
+      void this.triggerDrain()
+    }, RENAME_WINDOW_MS)
+    this.pendingUnlinks.set(path, { hash, timer })
+  }
+
+  /**
+   * Cherche un unlink en attente avec ce hash. Si trouvé : annule le timer,
+   * retire de la map, retourne le path. Sinon : undefined.
+   */
+  private popPendingUnlinkByHash(hash: string): string | undefined {
+    for (const [path, entry] of this.pendingUnlinks.entries()) {
+      if (entry.hash === hash) {
+        clearTimeout(entry.timer)
+        this.pendingUnlinks.delete(path)
+        return path
+      }
+    }
+    return undefined
   }
 
   /**
@@ -522,6 +582,8 @@ export class SyncEngine {
     this.drainInFlight = false
     this.pullPipeline?.reset()
     this.pullPipeline = undefined
+    for (const { timer } of this.pendingUnlinks.values()) clearTimeout(timer)
+    this.pendingUnlinks.clear()
     this.status = { state: "idle" }
   }
 }
