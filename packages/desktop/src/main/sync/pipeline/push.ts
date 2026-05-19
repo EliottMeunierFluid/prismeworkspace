@@ -316,12 +316,15 @@ async function pushDelete(op: PendingOp, opts: PushPipelineOptions): Promise<boo
   const encryptedPathBuf = await encryptPath(op.path, opts.keys)
   const encryptedPathB64 = encryptedPathBuf.toString("base64")
 
+  // NB serveur ② : WsPushSchema exige hash: /^[0-9a-f]{64}$/i même pour les
+  // deletes (le hash n'est pas utilisé côté handler delete mais validé en
+  // amont). On envoie un hash factice "00...0" (64 zéros hex).
   const deleteMsg: WsPushMessage = {
     op: "push",
     uid: op.uid,
     path: encryptedPathB64,
     extension: extname(op.path).slice(1),
-    hash: "",
+    hash: "0".repeat(64),
     ctime: meta.ctime_ms ?? 0,
     mtime: meta.mtime_ms ?? Date.now(),
     folder: false,
