@@ -66,6 +66,7 @@ function makeFakeTransport() {
     sent,
     next: () => activeWaiter?.onNext(),
     ok: (vv?: number) => activeWaiter?.onOk(vv),
+    conflict: (info: import("./push").ConflictInfo) => activeWaiter?.onConflict(info),
     err: (m: string) => activeWaiter?.onError(m),
   }
 }
@@ -267,6 +268,67 @@ describe("sync push pipeline", () => {
     expect(db.getServerFile("old.md")).toBeUndefined()
     expect(db.getServerFile("new.md")).toBeDefined()
     expect(db.getMeta("last_known_version")).toBe("44")
+  })
+
+  test("push conflict : serveur refuse → onConflict appelé, push échoue", async () => {
+    writeFileSync(join(dir, "race.md"), "my local edit")
+    db.upsertLocalFile("race.md", {
+      hash: "abcd",
+      size: 13,
+      mtime_ms: 100,
+      ctime_ms: 50,
+      is_folder: false,
+    })
+    // Cache server existant → expected_old_hash sera envoyé
+    db.upsertServerFile("race.md", {
+      hash: "oldServerHash",
+      size: 10,
+      mtime_ms: 50,
+      encrypted_path_b64: "x",
+      pieces: 1,
+    })
+    db.enqueuePending(
+      "race.md",
+      "push",
+      JSON.stringify({ hash: "abcd", size: 13, mtime_ms: 100, ctime_ms: 50 }),
+    )
+
+    const fake = makeFakeTransport()
+    let conflictCalled: { path: string; currentHash: string } | undefined
+    const pipeline = createPushPipeline({
+      workspaceRoot: dir,
+      db,
+      keys,
+      transport: fake.transport,
+      onConflict: async (path, info) => {
+        conflictCalled = { path, currentHash: info.currentHash }
+      },
+    })
+
+    const drainPromise = pipeline.drain()
+    await new Promise((r) => setTimeout(r, 10))
+    // Le serveur répond conflict au lieu de next/ok
+    fake.conflict({
+      currentHash: "newerServerHash",
+      currentSize: 20,
+      currentPieces: 1,
+      currentCtime: 60,
+      currentMtime: 200,
+    })
+    const result = await drainPromise
+
+    expect(result.processed).toBe(0)
+    expect(result.failed).toBe(1)
+    expect(conflictCalled).toBeDefined()
+    expect(conflictCalled?.path).toBe("race.md")
+    expect(conflictCalled?.currentHash).toBe("newerServerHash")
+
+    // Pas de chunks binaires envoyés (le push a été aborted avant)
+    expect(fake.sent.filter((s) => s.kind === "binary").length).toBe(0)
+
+    // Le push msg contient expected_old_hash
+    const pushMsg = fake.sent.find((s) => s.kind === "json")?.data as Record<string, unknown>
+    expect(pushMsg.expected_old_hash).toBe("oldServerHash")
   })
 
   test("drain vide : no-op", async () => {

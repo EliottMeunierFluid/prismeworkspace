@@ -27,8 +27,9 @@
  */
 
 import { createHash } from "node:crypto"
-import { readFile } from "node:fs/promises"
-import { extname, join } from "node:path"
+import { mkdir, readFile, writeFile } from "node:fs/promises"
+import { dirname, extname, join } from "node:path"
+import { SYNC_CONFIG_DIRNAME } from "../constants"
 import {
   encryptContentChunked,
   encryptPath,
@@ -47,31 +48,44 @@ const PUSH_ROUND_TRIP_TIMEOUT_MS = 30_000
  * donc une seule instance vit à la fois ; les autres messages WS sont
  * délégués à l'engine (qui les route vers ce waiter quand actif).
  */
+export interface ConflictInfo {
+  currentHash: string
+  currentSize: number
+  currentPieces: number
+  currentCtime: number
+  currentMtime: number
+}
+
 export interface PushWaiter {
-  /** Résout au prochain `{op:"next"}` reçu, rejette sur timeout/error/close. */
-  awaitNext: () => Promise<void>
+  /**
+   * Résout au prochain `{op:"next"}` (chunks attendus) ou `{op:"conflict"}`
+   * (refus serveur avant chunks). Rejette sur timeout/error/close.
+   */
+  awaitNextOrConflict: () => Promise<{ kind: "next" } | { kind: "conflict"; info: ConflictInfo }>
   /** Résout au prochain `{op:"ok"}` reçu. */
   awaitOk: () => Promise<{ vaultVersion?: number }>
   /** Signaux à appeler par l'engine sur réception WS. */
   onNext: () => void
   onOk: (vaultVersion?: number) => void
+  onConflict: (info: ConflictInfo) => void
   onError: (message: string) => void
   onClose: () => void
 }
 
 /** Crée un waiter pour la prochaine paire next/ok. */
 export function createPushWaiter(): PushWaiter {
-  let nextResolve: (() => void) | undefined
-  let nextReject: ((err: Error) => void) | undefined
+  type NextOrConflict = { kind: "next" } | { kind: "conflict"; info: ConflictInfo }
+  let nocResolve: ((v: NextOrConflict) => void) | undefined
+  let nocReject: ((err: Error) => void) | undefined
   let okResolve: ((v: { vaultVersion?: number }) => void) | undefined
   let okReject: ((err: Error) => void) | undefined
 
   return {
-    awaitNext: () =>
-      new Promise<void>((resolve, reject) => {
-        nextResolve = resolve
-        nextReject = reject
-        setTimeout(() => reject(new Error("timeout waiting for 'next'")), PUSH_ROUND_TRIP_TIMEOUT_MS)
+    awaitNextOrConflict: () =>
+      new Promise<NextOrConflict>((resolve, reject) => {
+        nocResolve = resolve
+        nocReject = reject
+        setTimeout(() => reject(new Error("timeout waiting for 'next'|'conflict'")), PUSH_ROUND_TRIP_TIMEOUT_MS)
       }),
     awaitOk: () =>
       new Promise<{ vaultVersion?: number }>((resolve, reject) => {
@@ -80,23 +94,28 @@ export function createPushWaiter(): PushWaiter {
         setTimeout(() => reject(new Error("timeout waiting for 'ok'")), PUSH_ROUND_TRIP_TIMEOUT_MS)
       }),
     onNext: () => {
-      nextResolve?.()
-      nextResolve = undefined
-      nextReject = undefined
+      nocResolve?.({ kind: "next" })
+      nocResolve = undefined
+      nocReject = undefined
     },
     onOk: (vaultVersion) => {
       okResolve?.({ vaultVersion })
       okResolve = undefined
       okReject = undefined
     },
+    onConflict: (info) => {
+      nocResolve?.({ kind: "conflict", info })
+      nocResolve = undefined
+      nocReject = undefined
+    },
     onError: (message) => {
       const err = new Error(`server error: ${message}`)
-      nextReject?.(err)
+      nocReject?.(err)
       okReject?.(err)
     },
     onClose: () => {
       const err = new Error("WS closed mid-push")
-      nextReject?.(err)
+      nocReject?.(err)
       okReject?.(err)
     },
   }
@@ -126,6 +145,13 @@ export interface PushPipelineOptions {
   db: SyncStateDb
   keys: VaultKeys
   transport: PushTransport
+  /**
+   * Étape 43 : callback appelé quand un push est rejeté par conflict.
+   * Le caller doit pull le current_hash du serveur, faire conflict copy +
+   * merge, puis re-enqueue le push (avec le nouveau expected_old_hash).
+   * Sans cb, le push échoue silencieusement et le client perd les modifs.
+   */
+  onConflict?: (path: string, info: ConflictInfo, localPlaintext: Buffer) => Promise<void>
 }
 
 /**
@@ -254,6 +280,11 @@ async function pushFile(op: PendingOp, opts: PushPipelineOptions): Promise<boole
   const meta = parsePushPayload(op.data)
   const extension = extname(op.path).slice(1) // "md" pas ".md"
 
+  // Étape 43 : optimistic concurrency control. Si on a déjà sync ce fichier,
+  // on envoie le hash de la dernière version serveur connue. Le serveur
+  // rejette le push si sa version courante diffère = autre device a push.
+  const cachedServer = opts.db.getServerFile(op.path)
+
   const pushMsg: WsPushMessage = {
     op: "push",
     uid: op.uid,
@@ -266,6 +297,7 @@ async function pushFile(op: PendingOp, opts: PushPipelineOptions): Promise<boole
     deleted: false,
     size: sizeBytes,
     pieces: chunks.length,
+    ...(cachedServer ? { expected_old_hash: cachedServer.hash } : {}),
   }
 
   log.info("[sync/push] sending", {
@@ -278,7 +310,16 @@ async function pushFile(op: PendingOp, opts: PushPipelineOptions): Promise<boole
   const waiter = opts.transport.beginPush()
   try {
     opts.transport.sendJson(pushMsg)
-    await waiter.awaitNext()
+    const firstResponse = await waiter.awaitNextOrConflict()
+    if (firstResponse.kind === "conflict") {
+      log.warn("[sync/push] conflict — server has newer version", {
+        uid: op.uid,
+        path: op.path,
+        current_hash: firstResponse.info.currentHash,
+      })
+      await opts.onConflict?.(op.path, firstResponse.info, plaintext)
+      return false
+    }
     for (const chunk of chunks) opts.transport.sendBinary(chunk)
     const okResult = await waiter.awaitOk()
     log.info("[sync/push] ok", { uid: op.uid, vault_version: okResult.vaultVersion })
@@ -295,6 +336,9 @@ async function pushFile(op: PendingOp, opts: PushPipelineOptions): Promise<boole
     if (okResult.vaultVersion !== undefined) {
       opts.db.setMeta("last_known_version", String(okResult.vaultVersion))
     }
+    // Étape 44 : met à jour la base ancestor (= ce qu'on vient de push,
+    // qui devient le nouveau "dernier remote sync connu").
+    await writeBaseCache(opts.workspaceRoot, op.path, plaintext)
     return true
   } catch (err) {
     log.warn("[sync/push] failed", {
@@ -390,4 +434,20 @@ function safeJsonObject(raw: string): Record<string, unknown> {
  */
 export function sha256Hex(buf: Buffer): string {
   return createHash("sha256").update(buf).digest("hex")
+}
+
+/**
+ * Met à jour la base ancestor cache après un push réussi (Étape 44).
+ * Le fichier vivant à `<workspaceRoot>/.prisma-sync/base/<sha256(path).hex>`
+ * est la référence pour un futur merge 3-way si conflit pull entrant.
+ */
+async function writeBaseCache(
+  workspaceRoot: string,
+  relPath: string,
+  content: Buffer,
+): Promise<void> {
+  const hashed = createHash("sha256").update(relPath).digest("hex")
+  const dest = join(workspaceRoot, SYNC_CONFIG_DIRNAME, "base", hashed)
+  await mkdir(dirname(dest), { recursive: true })
+  await writeFile(dest, content)
 }
