@@ -334,6 +334,17 @@ export class SyncEngine {
             this.activePushWaiter?.onOk(vv)
             return
           }
+          // Étape 43 — conflict détecté côté serveur (expected_old_hash diverge)
+          if (data.op === "conflict") {
+            this.activePushWaiter?.onConflict({
+              currentHash: typeof data.current_hash === "string" ? data.current_hash : "",
+              currentSize: typeof data.current_size === "number" ? data.current_size : 0,
+              currentPieces: typeof data.current_pieces === "number" ? data.current_pieces : 0,
+              currentCtime: typeof data.current_ctime === "number" ? data.current_ctime : 0,
+              currentMtime: typeof data.current_mtime === "number" ? data.current_mtime : Date.now(),
+            })
+            return
+          }
           // Étape 33 — broadcast multi-device : un AUTRE device a push.
           // Le serveur filtre nos propres pushs (except_device_id), donc tout
           // {op:"push"} reçu vient d'un autre device.
@@ -436,11 +447,44 @@ export class SyncEngine {
       db: this.db,
       keys,
       transport,
+      // Étape 43 : sur conflict push, on conflict-copy le local. Le pull
+      // inbound broadcast (automatique car un autre device vient de push)
+      // remplacera le on-disk avec le current serveur.
+      onConflict: async (path, info, localPlaintext) => {
+        if (!this.workspaceRoot) return
+        const absPath = join(this.workspaceRoot, path)
+        const ext = path.includes(".") ? `.${path.split(".").pop()}` : ""
+        const base = absPath.slice(0, absPath.length - ext.length)
+        const iso = new Date().toISOString().replace(/[:.]/g, "-")
+        const conflictPath = `${base}.conflict-push-${iso}${ext}`
+        try {
+          await import("node:fs/promises").then((m) => m.writeFile(conflictPath, localPlaintext))
+          log.warn("[sync/engine] push conflict — local saved to copy", {
+            path,
+            conflictCopy: conflictPath,
+            serverHashPrefix: info.currentHash.slice(0, 12),
+          })
+        } catch (err) {
+          log.warn("[sync/engine] failed to save push conflict copy", {
+            err: err instanceof Error ? err.message : String(err),
+          })
+        }
+        // Invalide le cache server_files pour que le prochain push sans
+        // expected_old_hash refasse une création complète. Le broadcast
+        // inbound du serveur va aussi peupler les caches.
+        this.db?.deleteServerFile(path)
+      },
     })
     this.pullPipeline = createPullPipeline({
       workspaceRoot: this.workspaceRoot,
       db: this.db,
       keys,
+      onMergeNeedsPush: () => {
+        // Le pull a fait un merge 3-way → push enqueué. Trigger drain
+        // (non-bloquant) pour propager le merge au serveur ② et
+        // converger avec les autres devices.
+        void this.triggerDrain()
+      },
     })
 
     // Étape 38 : bootstrap — récupère les fichiers existants du vault avant

@@ -228,6 +228,41 @@ async function main() {
     console.log(`[multidevice] ✓ B's local edit preserved in conflict copy`)
   }
 
+  // ─── Scénario 7 : merge 3-way clean (modifs sur lignes différentes) ────
+  console.log("\n[multidevice] === scenario 7 : 3-way merge (different lines) ===")
+  const mergeName = "notes.md"
+  const baseContent = "line 1\nline 2\nline 3\nline 4\nline 5\n"
+  writeFileSync(join(wsA, mergeName), baseContent)
+  await waitUntil(
+    "B receives base notes.md",
+    () => existsSync(join(wsB, mergeName))
+      && readFileSync(join(wsB, mergeName), "utf8") === baseContent,
+  )
+
+  // A modifie ligne 2, B modifie ligne 5 — pas de conflit textuel attendu
+  const aMod = "line 1\nline 2 — edited by A\nline 3\nline 4\nline 5\n"
+  const bMod = "line 1\nline 2\nline 3\nline 4\nline 5 — edited by B\n"
+  writeFileSync(join(wsA, mergeName), aMod)
+  await wait(100)
+  writeFileSync(join(wsB, mergeName), bMod)
+
+  // Selon qui push d'abord, l'autre fera un merge 3-way. Critère : le
+  // résultat final converge (les 2 devices ont le même contenu, qui
+  // contient les 2 modifs sans markers).
+  await waitUntil(
+    "merge3-way : les deux devices convergent vers un fichier sans markers",
+    () => {
+      if (!existsSync(join(wsA, mergeName)) || !existsSync(join(wsB, mergeName))) return false
+      const a = readFileSync(join(wsA, mergeName), "utf8")
+      const b = readFileSync(join(wsB, mergeName), "utf8")
+      if (a !== b) return false
+      if (a.includes("<<<<<<<") || a.includes(">>>>>>>")) return false
+      return a.includes("edited by A") && a.includes("edited by B")
+    },
+    20_000,
+  )
+  console.log(`[multidevice] ✓ merge3-way clean : both devices have line 2 + line 5 edits merged`)
+
   // ─── Cleanup ───────────────────────────────────────────────────────────
   console.log("\n[multidevice] deactivating both engines…")
   await engineA.deactivate()

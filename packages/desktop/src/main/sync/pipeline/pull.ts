@@ -26,6 +26,8 @@ import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
 import { dirname, extname, join, normalize, relative, sep } from "node:path"
 import { decryptContentChunked, decryptPath, type VaultKeys } from "@prisme/sync-crypto"
 import log from "electron-log"
+import { SYNC_CONFIG_DIRNAME } from "../constants"
+import { isTextFile, merge3Way } from "../merge"
 import type { LocalFileData, ServerFileData, SyncStateDb } from "../state/db"
 
 export interface InboundPushMeta {
@@ -68,6 +70,12 @@ export interface PullPipelineOptions {
   workspaceRoot: string
   db: SyncStateDb
   keys: VaultKeys
+  /**
+   * Appelé après qu'un pull inbound a produit un merge 3-way sans conflict.
+   * Le caller doit déclencher un drain push pour propager le merge au
+   * serveur (sinon les devices ne convergent pas).
+   */
+  onMergeNeedsPush?: () => void
 }
 
 export function createPullPipeline(opts: PullPipelineOptions): PullPipeline {
@@ -149,28 +157,74 @@ async function finalizeInbound(s: PullState, opts: PullPipelineOptions): Promise
     // `<path>.conflict-<device>-<ISO>.<ext>` avant écrasement.
     const remoteHash = sha256Hex(plaintext)
     const conflictDetected = await detectLocalConflict(absPath, opts, path, remoteHash)
+    let finalContent: Buffer = plaintext
+    let mergedSuccessfully = false
     if (conflictDetected) {
-      const conflictPath = await preserveLocalAsConflictCopy(
-        absPath,
-        s.meta.device ?? "remote",
-      )
-      log.warn("[sync/pull] conflict detected — local saved as copy", {
-        path,
-        conflictCopy: relative(opts.workspaceRoot, conflictPath),
-      })
+      // Étape 44 : tente un merge 3-way si fichier texte et qu'on a la base
+      // (= dernier remote sync). Sinon : conflict copy classique (Étape 39).
+      const mergeAttempt = await tryMerge3Way(absPath, opts, path, plaintext)
+      if (mergeAttempt && !mergeAttempt.hasConflicts) {
+        finalContent = Buffer.from(mergeAttempt.merged, "utf8")
+        mergedSuccessfully = true
+        log.info("[sync/pull] 3-way merge succeeded (no textual conflict)", { path })
+        // IMPORTANT : on doit push le merge au serveur sinon les 2 devices
+        // ne convergent pas (l'autre device a sa version, on a le merge,
+        // mais personne ne pousse le merge). Enqueue un push après le
+        // finalize (le drain sera triggered ailleurs).
+        // NB : on n'a pas accès au pushPipeline d'ici. Le watcher fs ne va
+        // PAS le faire car local_files.hash == sha256(merge) après finalize.
+        // → on enqueue explicitement en pending_files.
+        opts.db.enqueuePending(
+          path,
+          "push",
+          JSON.stringify({
+            hash: sha256Hex(finalContent),
+            size: finalContent.length,
+            mtime_ms: s.meta.mtime,
+            ctime_ms: s.meta.ctime,
+          }),
+        )
+        opts.onMergeNeedsPush?.()
+      } else if (mergeAttempt && mergeAttempt.hasConflicts) {
+        // Merge avec markers <<<<<<< — on l'écrit en place ; l'utilisateur
+        // doit éditer. Le local original part en conflict copy de secours.
+        finalContent = Buffer.from(mergeAttempt.merged, "utf8")
+        const conflictPath = await preserveLocalAsConflictCopy(
+          absPath,
+          s.meta.device ?? "remote",
+        )
+        log.warn("[sync/pull] 3-way merge with markers — manual edit needed", {
+          path,
+          blocks: mergeAttempt.conflictBlocks,
+          conflictCopy: relative(opts.workspaceRoot, conflictPath),
+        })
+      } else {
+        // Pas mergeable (binaire ou pas de base) → conflict copy classique
+        const conflictPath = await preserveLocalAsConflictCopy(
+          absPath,
+          s.meta.device ?? "remote",
+        )
+        log.warn("[sync/pull] conflict detected — local saved as copy", {
+          path,
+          conflictCopy: relative(opts.workspaceRoot, conflictPath),
+        })
+      }
     }
 
-    await atomicWrite(absPath, plaintext)
+    await atomicWrite(absPath, finalContent)
+    // Met à jour la base (dernier remote sync connu) pour le prochain merge.
+    await writeBaseCache(opts.workspaceRoot, path, plaintext)
     log.info("[sync/pull] inbound write OK", {
       path,
-      bytes: plaintext.length,
+      bytes: finalContent.length,
       device: s.meta.device,
       conflict: conflictDetected,
+      merged: mergedSuccessfully,
     })
 
     const localData: LocalFileData = {
-      hash: sha256Hex(plaintext),
-      size: plaintext.length,
+      hash: sha256Hex(finalContent),
+      size: finalContent.length,
       mtime_ms: s.meta.mtime,
       ctime_ms: s.meta.ctime,
       is_folder: false,
@@ -231,6 +285,48 @@ async function detectLocalConflict(
   const cachedLocal = opts.db.getLocalFile(relPath)
   if (!cachedLocal) return true // jamais sync → conservatif : conflict copy
   return cachedLocal.hash !== onDiskHash
+}
+
+/**
+ * Tente un merge 3-way si fichier texte ET base ancestor disponible.
+ * Retourne undefined si non applicable (binaire ou pas de base cache).
+ */
+async function tryMerge3Way(
+  absPath: string,
+  opts: PullPipelineOptions,
+  relPath: string,
+  remoteContent: Buffer,
+): Promise<{ merged: string; hasConflicts: boolean; conflictBlocks: number } | undefined> {
+  if (!isTextFile(relPath)) return undefined
+  let base: Buffer
+  try {
+    base = await readBaseCache(opts.workspaceRoot, relPath)
+  } catch {
+    return undefined // pas de base ancestor (1er pull ou cache invalidé)
+  }
+  let local: Buffer
+  try {
+    local = await readFile(absPath)
+  } catch {
+    return undefined
+  }
+  return merge3Way(base.toString("utf8"), local.toString("utf8"), remoteContent.toString("utf8"))
+}
+
+/** Chemin du fichier base cache : `<workspaceRoot>/.prisma-sync/base/<sha256(path).hex>`. */
+function baseCachePath(workspaceRoot: string, relPath: string): string {
+  const hashed = createHash("sha256").update(relPath).digest("hex")
+  return join(workspaceRoot, SYNC_CONFIG_DIRNAME, "base", hashed)
+}
+
+async function readBaseCache(workspaceRoot: string, relPath: string): Promise<Buffer> {
+  return readFile(baseCachePath(workspaceRoot, relPath))
+}
+
+async function writeBaseCache(workspaceRoot: string, relPath: string, content: Buffer): Promise<void> {
+  const dest = baseCachePath(workspaceRoot, relPath)
+  await mkdir(dirname(dest), { recursive: true })
+  await writeFile(dest, content)
 }
 
 /**
