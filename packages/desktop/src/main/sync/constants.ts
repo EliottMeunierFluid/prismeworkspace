@@ -33,6 +33,9 @@ export const RECONNECT_JITTER = 0.3
  *  fichier stable (debounce + détection rename atomique tempfile+rename). */
 export const FS_AWAIT_WRITE_FINISH_MS = 500
 
+/** Intervalle de re-sweep périodique (safety-net si watcher rate un event). */
+export const PERIODIC_SWEEP_INTERVAL_MS = 15 * 60 * 1000 // 15 minutes
+
 /** Patterns à exclure du watcher (en plus des défauts chokidar). */
 export const FS_IGNORED_PATTERNS = [/\.prisma-sync/, /\.git/, /node_modules/]
 
