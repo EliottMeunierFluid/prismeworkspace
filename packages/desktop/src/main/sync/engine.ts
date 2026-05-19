@@ -35,6 +35,7 @@ import {
   hasActiveKeys,
 } from "./keys"
 import { openStateDb, type SyncStateDb } from "./state/db"
+import { runInitialSweep, type SweepResult } from "./sweep"
 import { createWsClient, type WsClient } from "./transport/ws-client"
 import { startFileWatcher, type FileWatcher } from "./watcher"
 
@@ -88,9 +89,19 @@ export class SyncEngine {
   private watcher: FileWatcher | undefined
   private vaultId: string | undefined
   private workspaceRoot: string | undefined
+  /** Promise du sweep initial post-ready (Étape 30) — pour les tests / IPC. */
+  private initialSyncPromise: Promise<SweepResult> | undefined
 
   getStatus(): SyncStatus {
     return this.status
+  }
+
+  /**
+   * Attend la fin du sweep initial post-`ready` (utile en tests / E2E).
+   * Résout immédiatement avec `undefined` si l'engine n'a pas encore activé.
+   */
+  async awaitInitialSync(): Promise<SweepResult | undefined> {
+    return this.initialSyncPromise
   }
 
   /**
@@ -213,18 +224,11 @@ export class SyncEngine {
             })
             this.status = { state: "ready", vaultVersion: ready.vault_version }
             this.db?.setMeta("last_known_version", String(ready.vault_version))
-            // Session A : watcher démarre après ready, log only, pas de push.
-            if (this.workspaceRoot && !this.watcher) {
-              this.watcher = startFileWatcher({
-                workspaceRoot: this.workspaceRoot,
-                onEvent: (event) => {
-                  // Session A : no-op applicatif (logué par le watcher). Le
-                  // pipeline push (encrypt + enqueue + WS push) sera branché
-                  // ici en Session B.
-                  void event
-                },
-              })
-            }
+            // Étape 30 : sweep initial après ready, AVANT de démarrer le
+            // watcher. Le sweep s'exécute en background — settle() libère
+            // activate() immédiatement pour ne pas bloquer l'UI sur le scan
+            // d'un gros workspace. Tests / E2E peuvent await awaitInitialSync().
+            this.initialSyncPromise = this.runPostReadyTasks()
             settle(resolve)
             return
           }
@@ -263,6 +267,34 @@ export class SyncEngine {
   }
 
   /**
+   * Étape 30 : tâches post-ready (sweep initial puis watcher).
+   *
+   * Séquencement : sweep AVANT watcher pour éviter les races. Le sweep
+   * peuple `pending_files` avec les push à faire ; le pipeline push
+   * (Étape 31) drainera ensuite la queue. Le watcher démarre une fois le
+   * sweep terminé pour capter les events ultérieurs.
+   */
+  private async runPostReadyTasks(): Promise<SweepResult> {
+    if (!this.workspaceRoot || !this.db) {
+      throw new Error("post-ready tasks called without workspaceRoot/db")
+    }
+    const sweepResult = await runInitialSweep(this.workspaceRoot, this.db)
+
+    if (!this.watcher) {
+      this.watcher = startFileWatcher({
+        workspaceRoot: this.workspaceRoot,
+        onEvent: (event) => {
+          // Étape 32 branchera enqueue + drain push ici. Pour l'instant,
+          // les events sont logués par le watcher lui-même.
+          void event
+        },
+      })
+      await this.watcher.ready()
+    }
+    return sweepResult
+  }
+
+  /**
    * Désactive la sync — ferme le WS, zeroïse les clés, ferme la DB.
    * Idempotent.
    */
@@ -279,6 +311,7 @@ export class SyncEngine {
     this.db = undefined
     this.vaultId = undefined
     this.workspaceRoot = undefined
+    this.initialSyncPromise = undefined
     this.status = { state: "idle" }
   }
 }
