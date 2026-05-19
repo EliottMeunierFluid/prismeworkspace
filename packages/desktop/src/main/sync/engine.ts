@@ -250,15 +250,22 @@ export class SyncEngine {
               vault_version: ready.vault_version,
               per_file_max: ready.per_file_max,
               per_push_max: ready.per_push_max,
+              reconnect: settled,
             })
             this.status = { state: "ready", vaultVersion: ready.vault_version }
             this.db?.setMeta("last_known_version", String(ready.vault_version))
-            // Étape 30 : sweep initial après ready, AVANT de démarrer le
-            // watcher. Le sweep s'exécute en background — settle() libère
-            // activate() immédiatement pour ne pas bloquer l'UI sur le scan
-            // d'un gros workspace. Tests / E2E peuvent await awaitInitialSync().
-            this.initialSyncPromise = this.runPostReadyTasks()
-            settle(resolve)
+            if (!settled) {
+              // 1er ready (cold start) : sweep + drain + watcher.
+              this.initialSyncPromise = this.runPostReadyTasks()
+              settle(resolve)
+            } else {
+              // Étape 35 : ready re-reçu après reconnect. Le sweep + watcher
+              // sont déjà actifs. On relance juste un drain pour évacuer les
+              // ops accumulées pendant la déconnexion (watcher a continué à
+              // enqueuer, mais les sendJson ont été droppés "while not open").
+              log.info("[sync/engine] reconnected — triggering drain")
+              void this.triggerDrain()
+            }
             return
           }
           if (data.op === "error") {
