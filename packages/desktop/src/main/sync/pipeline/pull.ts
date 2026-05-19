@@ -21,6 +21,7 @@
  * silencieusement avec un warn.
  */
 
+import { createHash } from "node:crypto"
 import { mkdir, rename, rm, writeFile } from "node:fs/promises"
 import { dirname, join, normalize, relative, sep } from "node:path"
 import { decryptContentChunked, decryptPath, type VaultKeys } from "@prisme/sync-crypto"
@@ -211,9 +212,5 @@ async function safeDecryptPath(
 }
 
 function sha256Hex(buf: Buffer): string {
-  // Lazy import pour éviter une dépendance hard sur node:crypto au top
-  // (sweep.ts a déjà la même utility — on duplique 2 lignes pour éviter
-  // un import cyclique du module sweep).
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  return require("node:crypto").createHash("sha256").update(buf).digest("hex")
+  return createHash("sha256").update(buf).digest("hex")
 }
