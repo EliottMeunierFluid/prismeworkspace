@@ -36,6 +36,7 @@ import {
 } from "./keys"
 import { openStateDb, type SyncStateDb } from "./state/db"
 import { createWsClient, type WsClient } from "./transport/ws-client"
+import { startFileWatcher, type FileWatcher } from "./watcher"
 
 export interface SyncConfig {
   /** Chemin absolu du workspace (dossier racine que l'utilisateur veut sync). */
@@ -84,7 +85,9 @@ export class SyncEngine {
   private status: SyncStatus = { state: "idle" }
   private db: SyncStateDb | undefined
   private ws: WsClient | undefined
+  private watcher: FileWatcher | undefined
   private vaultId: string | undefined
+  private workspaceRoot: string | undefined
 
   getStatus(): SyncStatus {
     return this.status
@@ -135,6 +138,7 @@ export class SyncEngine {
     const initial = this.db.getMeta("last_known_version") === undefined
 
     this.vaultId = config.vaultId
+    this.workspaceRoot = config.workspaceRoot
 
     // 4. Connexion WS + handshake init.
     await this.connectAndHandshake({
@@ -209,6 +213,18 @@ export class SyncEngine {
             })
             this.status = { state: "ready", vaultVersion: ready.vault_version }
             this.db?.setMeta("last_known_version", String(ready.vault_version))
+            // Session A : watcher démarre après ready, log only, pas de push.
+            if (this.workspaceRoot && !this.watcher) {
+              this.watcher = startFileWatcher({
+                workspaceRoot: this.workspaceRoot,
+                onEvent: (event) => {
+                  // Session A : no-op applicatif (logué par le watcher). Le
+                  // pipeline push (encrypt + enqueue + WS push) sera branché
+                  // ici en Session B.
+                  void event
+                },
+              })
+            }
             settle(resolve)
             return
           }
@@ -252,12 +268,17 @@ export class SyncEngine {
    */
   async deactivate(): Promise<void> {
     log.info("[sync] deactivate")
+    if (this.watcher) {
+      await this.watcher.close()
+      this.watcher = undefined
+    }
     this.ws?.close()
     this.ws = undefined
     if (hasActiveKeys()) deactivateKeys()
     this.db?.close()
     this.db = undefined
     this.vaultId = undefined
+    this.workspaceRoot = undefined
     this.status = { state: "idle" }
   }
 }
