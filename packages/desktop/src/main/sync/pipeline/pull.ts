@@ -41,6 +41,9 @@ export interface InboundPushMeta {
   /** Device émetteur (pour log). */
   device?: string
   vaultVersion?: number
+  /** Optionnel : callback appelé à la fin du finalize (utile au bootstrap
+   *  pour await chaque pull séquentiellement). */
+  onComplete?: (ok: boolean) => void
 }
 
 export interface PullState {
@@ -124,8 +127,12 @@ export function createPullPipeline(opts: PullPipelineOptions): PullPipeline {
 
 async function finalizeInbound(s: PullState, opts: PullPipelineOptions): Promise<void> {
   const path = await safeDecryptPath(s.meta.pathB64, opts.keys, opts.workspaceRoot)
-  if (!path) return
+  if (!path) {
+    s.meta.onComplete?.(false)
+    return
+  }
 
+  let ok = false
   try {
     const plaintext = await decryptContentChunked(s.receivedChunks, opts.keys)
     const absPath = join(opts.workspaceRoot, path)
@@ -158,12 +165,14 @@ async function finalizeInbound(s: PullState, opts: PullPipelineOptions): Promise
     if (s.meta.vaultVersion !== undefined) {
       opts.db.setMeta("last_known_version", String(s.meta.vaultVersion))
     }
+    ok = true
   } catch (err) {
     log.warn("[sync/pull] inbound finalize failed", {
       path,
       err: err instanceof Error ? err.message : String(err),
     })
   }
+  s.meta.onComplete?.(ok)
 }
 
 /**

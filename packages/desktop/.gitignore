@@ -30,4 +30,5 @@ resources/icons
 # artefacts du smoke sync (scripts/sync-engine-smoke.mjs)
 .sync-smoke-bundle.mjs
 .sync-multidevice-bundle.mjs
+.sync-bootstrap-bundle.mjs
 /schema.sql

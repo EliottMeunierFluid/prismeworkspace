@@ -36,6 +36,12 @@ import {
   hasActiveKeys,
 } from "./keys"
 import {
+  createBootstrapWaiter,
+  runBootstrap,
+  type BootstrapTransport,
+  type BootstrapWaiter,
+} from "./pipeline/bootstrap"
+import {
   createPullPipeline,
   type InboundPushMeta,
   type PullPipeline,
@@ -122,6 +128,8 @@ export class SyncEngine {
   private drainInFlight = false
   /** Pipeline pull (Étape 33) — réception broadcasts multi-device. */
   private pullPipeline: PullPipeline | undefined
+  /** Waiter actif pendant le bootstrap (Étape 38) — list_meta + pull_meta. */
+  private activeBootstrapWaiter: BootstrapWaiter | undefined
   /**
    * Étape 34 — détection rename. Un `unlink` est tenu en attente RENAME_WINDOW
    * ms ; si un `add` avec le même hash arrive entre-temps, on enqueue rename
@@ -304,6 +312,10 @@ export class SyncEngine {
               this.activePushWaiter.onError(msg)
               return
             }
+            if (this.activeBootstrapWaiter) {
+              this.activeBootstrapWaiter.onError(msg)
+              return
+            }
             this.status = { state: "error", message: msg }
             settle(() => reject(new Error(`Sync server error: ${msg}`)))
             return
@@ -326,6 +338,27 @@ export class SyncEngine {
             void this.handleInboundPush(data)
             return
           }
+          // Étape 38 — bootstrap responses
+          if (data.op === "list_meta") {
+            const items = Array.isArray(data.items) ? (data.items as unknown[]) : []
+            this.activeBootstrapWaiter?.onListMeta(items as never)
+            return
+          }
+          if (data.op === "pull_meta") {
+            // IMPORTANT : on déclenche beginInbound IMMÉDIATEMENT pour ne pas
+            // perdre les chunks binaires qui suivent (Node WS event loop ne
+            // garantit pas d'ordre avec un await). Le pending path b64 est
+            // récupéré depuis la dernière requête pull du bootstrap.
+            const pullMeta = {
+              hash: typeof data.hash === "string" ? data.hash : "",
+              size: typeof data.size === "number" ? data.size : 0,
+              pieces: typeof data.pieces === "number" ? data.pieces : 0,
+              ctime: typeof data.ctime === "number" ? data.ctime : 0,
+              mtime: typeof data.mtime === "number" ? data.mtime : Date.now(),
+            }
+            this.activeBootstrapWaiter?.onPullMeta(pullMeta)
+            return
+          }
           log.info("[sync/engine] received op", { op: data.op })
         },
         onBinary: (chunk) => {
@@ -341,6 +374,8 @@ export class SyncEngine {
         onClose: (code, reason) => {
           // Si un push est en vol, on le débloque pour libérer le drain.
           this.activePushWaiter?.onClose()
+          // Bootstrap interrompu si en cours.
+          this.activeBootstrapWaiter?.onClose()
           // Reset l'inbound en cours — les chunks éventuellement reçus sont
           // corrompus si la connexion a coupé au milieu.
           this.pullPipeline?.reset()
@@ -374,9 +409,7 @@ export class SyncEngine {
     if (!this.workspaceRoot || !this.db || !this.vaultId) {
       throw new Error("post-ready tasks called without workspaceRoot/db/vaultId")
     }
-    const sweepResult = await runInitialSweep(this.workspaceRoot, this.db)
 
-    // Étape 31 : pipeline push.
     const keys = getActiveKeys(this.vaultId)
     const transport: PushTransport = {
       sendJson: (msg) => this.ws?.sendJson(msg),
@@ -401,6 +434,36 @@ export class SyncEngine {
       db: this.db,
       keys,
     })
+
+    // Étape 38 : bootstrap — récupère les fichiers existants du vault avant
+    // le sweep. Idempotent : skip les fichiers déjà en server_files avec le
+    // même hash. Important : doit tourner AVANT le sweep, sinon le sweep
+    // ne verrait pas les fichiers tirés et n'aurait rien à diff.
+    const bootstrapTransport: BootstrapTransport = {
+      sendJson: (msg) => this.ws?.sendJson(msg),
+      beginBootstrap: () => {
+        const w = createBootstrapWaiter()
+        this.activeBootstrapWaiter = w
+        return w
+      },
+      endBootstrap: () => {
+        this.activeBootstrapWaiter = undefined
+      },
+    }
+    try {
+      const bootstrapResult = await runBootstrap({
+        db: this.db,
+        pullPipeline: this.pullPipeline,
+        transport: bootstrapTransport,
+      })
+      log.info("[sync] bootstrap done", bootstrapResult)
+    } catch (err) {
+      log.warn("[sync] bootstrap failed (continuing with sweep anyway)", {
+        err: err instanceof Error ? err.message : String(err),
+      })
+    }
+
+    const sweepResult = await runInitialSweep(this.workspaceRoot, this.db)
     await this.pushPipeline.drain()
 
     if (!this.watcher) {
@@ -617,6 +680,7 @@ export class SyncEngine {
     this.drainInFlight = false
     this.pullPipeline?.reset()
     this.pullPipeline = undefined
+    this.activeBootstrapWaiter = undefined
     for (const { timer } of this.pendingUnlinks.values()) clearTimeout(timer)
     this.pendingUnlinks.clear()
     this.status = { state: "idle" }
