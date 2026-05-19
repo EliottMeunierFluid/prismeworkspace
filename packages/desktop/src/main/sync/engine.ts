@@ -32,8 +32,16 @@ import { CRYPTO_VERSION } from "./constants"
 import {
   activateKeys,
   deactivateKeys,
+  getActiveKeys,
   hasActiveKeys,
 } from "./keys"
+import {
+  createPushPipeline,
+  createPushWaiter,
+  type PushPipeline,
+  type PushTransport,
+  type PushWaiter,
+} from "./pipeline/push"
 import { openStateDb, type SyncStateDb } from "./state/db"
 import { runInitialSweep, type SweepResult } from "./sweep"
 import { createWsClient, type WsClient } from "./transport/ws-client"
@@ -91,6 +99,10 @@ export class SyncEngine {
   private workspaceRoot: string | undefined
   /** Promise du sweep initial post-ready (Étape 30) — pour les tests / IPC. */
   private initialSyncPromise: Promise<SweepResult> | undefined
+  /** Pipeline push (Étape 31) — créé après ready, drainé après sweep. */
+  private pushPipeline: PushPipeline | undefined
+  /** Waiter actif pour le push courant — 1 à la fois (drain séquentiel). */
+  private activePushWaiter: PushWaiter | undefined
 
   getStatus(): SyncStatus {
     return this.status
@@ -235,12 +247,27 @@ export class SyncEngine {
           if (data.op === "error") {
             const msg = typeof data.message === "string" ? data.message : "unknown error"
             log.warn("[sync/engine] server error", { code: data.code, message: msg })
+            // Si on a un push en cours, on le rejette plutôt que de tuer l'engine.
+            if (this.activePushWaiter) {
+              this.activePushWaiter.onError(msg)
+              return
+            }
             this.status = { state: "error", message: msg }
             settle(() => reject(new Error(`Sync server error: ${msg}`)))
             return
           }
           if (data.op === "pong") return
-          // Les autres opcodes (pull_meta, ok, next, …) seront gérés en Session B.
+          // Étape 31 — routing des réponses push vers le waiter actif.
+          if (data.op === "next") {
+            this.activePushWaiter?.onNext()
+            return
+          }
+          if (data.op === "ok") {
+            const vv = typeof data.vault_version === "number" ? data.vault_version : undefined
+            this.activePushWaiter?.onOk(vv)
+            return
+          }
+          // Les opcodes pull (pull_meta, …) seront gérés en Étape 33.
           log.info("[sync/engine] received op", { op: data.op })
         },
         onBinary: (chunk) => {
@@ -248,6 +275,8 @@ export class SyncEngine {
           log.info("[sync/engine] binary message ignored (Session A)", { bytes: chunk.length })
         },
         onClose: (code, reason) => {
+          // Si un push est en vol, on le débloque pour libérer le drain.
+          this.activePushWaiter?.onClose()
           if (settled) {
             // Fermeture après ready — passage en disconnected, le reconnect
             // est géré par le ws-client. Le re-handshake init après reconnect
@@ -267,18 +296,40 @@ export class SyncEngine {
   }
 
   /**
-   * Étape 30 : tâches post-ready (sweep initial puis watcher).
+   * Étapes 30 + 31 : tâches post-ready.
    *
-   * Séquencement : sweep AVANT watcher pour éviter les races. Le sweep
-   * peuple `pending_files` avec les push à faire ; le pipeline push
-   * (Étape 31) drainera ensuite la queue. Le watcher démarre une fois le
-   * sweep terminé pour capter les events ultérieurs.
+   * Séquencement : sweep → pipeline push drain → watcher. Le sweep peuple
+   * `pending_files` ; le pipeline drain la queue. Le watcher démarre après
+   * pour capter les events ultérieurs (l'enqueue depuis le watcher viendra
+   * en Étape 32).
    */
   private async runPostReadyTasks(): Promise<SweepResult> {
-    if (!this.workspaceRoot || !this.db) {
-      throw new Error("post-ready tasks called without workspaceRoot/db")
+    if (!this.workspaceRoot || !this.db || !this.vaultId) {
+      throw new Error("post-ready tasks called without workspaceRoot/db/vaultId")
     }
     const sweepResult = await runInitialSweep(this.workspaceRoot, this.db)
+
+    // Étape 31 : pipeline push.
+    const keys = getActiveKeys(this.vaultId)
+    const transport: PushTransport = {
+      sendJson: (msg) => this.ws?.sendJson(msg),
+      sendBinary: (chunk) => this.ws?.sendBinary(chunk),
+      beginPush: () => {
+        const w = createPushWaiter()
+        this.activePushWaiter = w
+        return w
+      },
+      endPush: () => {
+        this.activePushWaiter = undefined
+      },
+    }
+    this.pushPipeline = createPushPipeline({
+      workspaceRoot: this.workspaceRoot,
+      db: this.db,
+      keys,
+      transport,
+    })
+    await this.pushPipeline.drain()
 
     if (!this.watcher) {
       this.watcher = startFileWatcher({
@@ -312,6 +363,8 @@ export class SyncEngine {
     this.vaultId = undefined
     this.workspaceRoot = undefined
     this.initialSyncPromise = undefined
+    this.pushPipeline = undefined
+    this.activePushWaiter = undefined
     this.status = { state: "idle" }
   }
 }

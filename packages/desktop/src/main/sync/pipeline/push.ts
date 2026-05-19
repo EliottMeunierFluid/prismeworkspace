@@ -1,0 +1,334 @@
+/**
+ * Pipeline push — drainage de `pending_files` vers le serveur sync ②.
+ *
+ * Source de vérité : docs/SYNC_ARCHITECTURE_SPEC.md §3.3.3 + §4.4 +
+ * contracts/ws.ts (WsPushMessage / WsNextMessage / WsOkMessage).
+ *
+ * Flow pour un push avec contenu :
+ *   client → {op:"push", uid, path:encryptedPathB64, hash, pieces, size, ...}
+ *   server → {op:"next"}
+ *   client → BinaryMessage[0..pieces-1]   (chunks chiffrés)
+ *   server → {op:"ok", uid, vault_version}
+ *
+ * Flow pour un delete :
+ *   client → {op:"push", uid, path, hash:"", pieces:0, deleted:true, ...}
+ *   server → {op:"ok", uid}
+ *
+ * Le drain est séquentiel : une op à la fois pour pouvoir lier les
+ * réponses `next` / `ok` à l'op en cours. Si une op échoue (timeout, erreur
+ * serveur, fichier disparu), on log et on passe à la suivante — la queue
+ * reste persistée et sera retentée au prochain drain. La pending entry est
+ * SUPPRIMÉE après `ok` reçu (pas avant), pour ne pas perdre l'op si l'engine
+ * crashe entre push et ok.
+ *
+ * SECURITY : le `path` envoyé sur le WS est l'output de `encryptPath`
+ * (AES-SIV en base64) — JAMAIS le path clair. L'extension elle est en clair
+ * (legacy Obsidian, leak mineur du type de fichier, à durcir en v2).
+ */
+
+import { createHash } from "node:crypto"
+import { readFile } from "node:fs/promises"
+import { extname, join } from "node:path"
+import {
+  encryptContentChunked,
+  encryptPath,
+  payloadHash,
+  type VaultKeys,
+} from "@prisme/sync-crypto"
+import type { WsPushMessage } from "@prisme/sync-crypto/contracts"
+import log from "electron-log"
+import type { PendingOp, ServerFileData, SyncStateDb } from "../state/db"
+
+/** Délai max d'attente pour un `next` ou `ok` du serveur. */
+const PUSH_ROUND_TRIP_TIMEOUT_MS = 30_000
+
+/**
+ * Waiter pour matcher next/ok à l'op en cours. Le pipeline est séquentiel
+ * donc une seule instance vit à la fois ; les autres messages WS sont
+ * délégués à l'engine (qui les route vers ce waiter quand actif).
+ */
+export interface PushWaiter {
+  /** Résout au prochain `{op:"next"}` reçu, rejette sur timeout/error/close. */
+  awaitNext: () => Promise<void>
+  /** Résout au prochain `{op:"ok"}` reçu. */
+  awaitOk: () => Promise<{ vaultVersion?: number }>
+  /** Signaux à appeler par l'engine sur réception WS. */
+  onNext: () => void
+  onOk: (vaultVersion?: number) => void
+  onError: (message: string) => void
+  onClose: () => void
+}
+
+/** Crée un waiter pour la prochaine paire next/ok. */
+export function createPushWaiter(): PushWaiter {
+  let nextResolve: (() => void) | undefined
+  let nextReject: ((err: Error) => void) | undefined
+  let okResolve: ((v: { vaultVersion?: number }) => void) | undefined
+  let okReject: ((err: Error) => void) | undefined
+
+  return {
+    awaitNext: () =>
+      new Promise<void>((resolve, reject) => {
+        nextResolve = resolve
+        nextReject = reject
+        setTimeout(() => reject(new Error("timeout waiting for 'next'")), PUSH_ROUND_TRIP_TIMEOUT_MS)
+      }),
+    awaitOk: () =>
+      new Promise<{ vaultVersion?: number }>((resolve, reject) => {
+        okResolve = resolve
+        okReject = reject
+        setTimeout(() => reject(new Error("timeout waiting for 'ok'")), PUSH_ROUND_TRIP_TIMEOUT_MS)
+      }),
+    onNext: () => {
+      nextResolve?.()
+      nextResolve = undefined
+      nextReject = undefined
+    },
+    onOk: (vaultVersion) => {
+      okResolve?.({ vaultVersion })
+      okResolve = undefined
+      okReject = undefined
+    },
+    onError: (message) => {
+      const err = new Error(`server error: ${message}`)
+      nextReject?.(err)
+      okReject?.(err)
+    },
+    onClose: () => {
+      const err = new Error("WS closed mid-push")
+      nextReject?.(err)
+      okReject?.(err)
+    },
+  }
+}
+
+export interface PushTransport {
+  sendJson: (msg: object) => void
+  sendBinary: (chunk: Buffer) => void
+  /** Crée un nouveau waiter et l'enregistre comme actif (1 à la fois). */
+  beginPush: () => PushWaiter
+  /** Désenregistre le waiter actif après ok/error. */
+  endPush: () => void
+}
+
+export interface PushPipeline {
+  /** Drain complet de la pending queue. Idempotent — no-op si vide. */
+  drain: () => Promise<PushDrainResult>
+}
+
+export interface PushDrainResult {
+  processed: number
+  failed: number
+}
+
+export interface PushPipelineOptions {
+  workspaceRoot: string
+  db: SyncStateDb
+  keys: VaultKeys
+  transport: PushTransport
+}
+
+/**
+ * Construit le pipeline push. Le caller (engine) est responsable de wirer
+ * `transport.beginPush` au routing des messages WS (cf engine.ts).
+ */
+export function createPushPipeline(opts: PushPipelineOptions): PushPipeline {
+  return {
+    drain: async () => {
+      let processed = 0
+      let failed = 0
+      // On itère op par op — listPending() renvoie un snapshot, mais on
+      // re-récupère la liste à chaque tour pour absorber les enqueues
+      // concurrents (watcher de l'Étape 32).
+      while (true) {
+        const queue = opts.db.listPending()
+        if (queue.length === 0) break
+        const op = queue[0]
+        const ok = await pushOne(op, opts)
+        if (ok) {
+          opts.db.removePending(op.uid)
+          processed++
+        } else {
+          failed++
+          // Une op échouée bloque la queue (FIFO strict). On sort pour ne
+          // pas tourner en boucle ; le caller relancera drain plus tard.
+          break
+        }
+      }
+      log.info("[sync/push] drain done", { processed, failed })
+      return { processed, failed }
+    },
+  }
+}
+
+async function pushOne(op: PendingOp, opts: PushPipelineOptions): Promise<boolean> {
+  if (op.op === "push") return await pushFile(op, opts)
+  if (op.op === "delete") return await pushDelete(op, opts)
+  log.warn("[sync/push] unsupported op (will retry later)", { op: op.op, uid: op.uid })
+  // rename = Étape 34
+  return false
+}
+
+async function pushFile(op: PendingOp, opts: PushPipelineOptions): Promise<boolean> {
+  // Lire le fichier clair
+  const absPath = join(opts.workspaceRoot, op.path)
+  let plaintext: Buffer
+  try {
+    plaintext = await readFile(absPath)
+  } catch (err) {
+    // Le fichier a disparu entre l'enqueue et le drain (rare) — on traite
+    // comme un delete pour ne pas bloquer la queue.
+    log.warn("[sync/push] file vanished, converting to delete", {
+      path: op.path,
+      err: err instanceof Error ? err.message : String(err),
+    })
+    return pushDelete({ ...op, op: "delete" }, opts)
+  }
+
+  // Chiffrer contenu (chunks 2 MB) + path (déterministe).
+  // NB : encryptPath est async (miscreant SIV).
+  const chunks = encryptContentChunked(plaintext, opts.keys)
+  const encryptedPathBuf = await encryptPath(op.path, opts.keys)
+  const encryptedPathB64 = encryptedPathBuf.toString("base64")
+  const concatenated = Buffer.concat(chunks)
+  const hashHex = payloadHash(concatenated).toString("hex")
+  const sizeBytes = concatenated.length
+
+  // ctime/mtime persistés à l'enqueue (cf sweep.ts)
+  const meta = parsePushPayload(op.data)
+  const extension = extname(op.path).slice(1) // "md" pas ".md"
+
+  const pushMsg: WsPushMessage = {
+    op: "push",
+    uid: op.uid,
+    path: encryptedPathB64,
+    extension,
+    hash: hashHex,
+    ctime: meta.ctime_ms,
+    mtime: meta.mtime_ms,
+    folder: false,
+    deleted: false,
+    size: sizeBytes,
+    pieces: chunks.length,
+  }
+
+  log.info("[sync/push] sending", {
+    uid: op.uid,
+    path: op.path, // path CLAIR uniquement en log local (debug), JAMAIS sur le WS
+    pieces: chunks.length,
+    sizeBytes,
+  })
+
+  const waiter = opts.transport.beginPush()
+  try {
+    opts.transport.sendJson(pushMsg)
+    await waiter.awaitNext()
+    for (const chunk of chunks) opts.transport.sendBinary(chunk)
+    const okResult = await waiter.awaitOk()
+    log.info("[sync/push] ok", { uid: op.uid, vault_version: okResult.vaultVersion })
+
+    // Persister l'état serveur connu pour ce fichier (pour résolution Étape 33+)
+    const serverData: ServerFileData = {
+      hash: hashHex,
+      size: sizeBytes,
+      mtime_ms: meta.mtime_ms,
+      encrypted_path_b64: encryptedPathB64,
+      pieces: chunks.length,
+    }
+    opts.db.upsertServerFile(op.path, serverData)
+    if (okResult.vaultVersion !== undefined) {
+      opts.db.setMeta("last_known_version", String(okResult.vaultVersion))
+    }
+    return true
+  } catch (err) {
+    log.warn("[sync/push] failed", {
+      uid: op.uid,
+      path: op.path,
+      err: err instanceof Error ? err.message : String(err),
+    })
+    return false
+  } finally {
+    opts.transport.endPush()
+  }
+}
+
+async function pushDelete(op: PendingOp, opts: PushPipelineOptions): Promise<boolean> {
+  const meta = parsePushPayload(op.data, { tolerantMissingMtime: true })
+  const encryptedPathBuf = await encryptPath(op.path, opts.keys)
+  const encryptedPathB64 = encryptedPathBuf.toString("base64")
+
+  const deleteMsg: WsPushMessage = {
+    op: "push",
+    uid: op.uid,
+    path: encryptedPathB64,
+    extension: extname(op.path).slice(1),
+    hash: "",
+    ctime: meta.ctime_ms ?? 0,
+    mtime: meta.mtime_ms ?? Date.now(),
+    folder: false,
+    deleted: true,
+    size: 0,
+    pieces: 0,
+  }
+
+  log.info("[sync/push] sending delete", { uid: op.uid, path: op.path })
+  const waiter = opts.transport.beginPush()
+  try {
+    opts.transport.sendJson(deleteMsg)
+    const okResult = await waiter.awaitOk()
+    log.info("[sync/push] delete ok", { uid: op.uid, vault_version: okResult.vaultVersion })
+    opts.db.deleteServerFile(op.path)
+    if (okResult.vaultVersion !== undefined) {
+      opts.db.setMeta("last_known_version", String(okResult.vaultVersion))
+    }
+    return true
+  } catch (err) {
+    log.warn("[sync/push] delete failed", {
+      uid: op.uid,
+      path: op.path,
+      err: err instanceof Error ? err.message : String(err),
+    })
+    return false
+  } finally {
+    opts.transport.endPush()
+  }
+}
+
+interface PushPayloadMeta {
+  hash?: string
+  size?: number
+  mtime_ms?: number
+  ctime_ms?: number
+}
+
+function parsePushPayload(
+  raw: string,
+  options: { tolerantMissingMtime?: boolean } = {},
+): { hash: string; size: number; mtime_ms: number; ctime_ms: number } & PushPayloadMeta {
+  const parsed = safeJsonObject(raw)
+  const mtime = typeof parsed.mtime_ms === "number" ? parsed.mtime_ms : undefined
+  const ctime = typeof parsed.ctime_ms === "number" ? parsed.ctime_ms : undefined
+  if (!options.tolerantMissingMtime && (mtime === undefined || ctime === undefined)) {
+    throw new Error(`pending payload missing mtime/ctime: ${raw}`)
+  }
+  return {
+    hash: typeof parsed.hash === "string" ? parsed.hash : "",
+    size: typeof parsed.size === "number" ? parsed.size : 0,
+    mtime_ms: mtime ?? 0,
+    ctime_ms: ctime ?? 0,
+  }
+}
+
+function safeJsonObject(raw: string): Record<string, unknown> {
+  const v = JSON.parse(raw) as unknown
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return {}
+  return v as Record<string, unknown>
+}
+
+/**
+ * Hash SHA-256 hex utilitaire (utile pour vérification, pas utilisé dans le
+ * flux push lui-même — on a déjà payloadHash du crypto kit pour ça).
+ */
+export function sha256Hex(buf: Buffer): string {
+  return createHash("sha256").update(buf).digest("hex")
+}
