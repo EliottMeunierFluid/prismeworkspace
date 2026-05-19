@@ -121,15 +121,32 @@ async function main() {
   }
   console.log(`[smoke] ✓ engine ready (vault_version=${status.vaultVersion})`)
 
-  // Trigger watcher events
-  console.log("[smoke] triggering fs events…")
+  // Attendre la fin du sweep initial + démarrage watcher avant d'écrire,
+  // sinon les writes survenus avant `watcher.ready()` sont ignorés
+  // (ignoreInitial: true côté chokidar).
+  await engine.awaitInitialSync()
+  console.log("[smoke] ✓ initial sync done — watcher is now live")
+
+  // Trigger watcher events — scénarios à tester :
+  //   1) create  : write "v1" puis attendre push + ok
+  //   2) update  : write "v2" sur le même fichier → 2e push + ok
+  //   3) delete  : unlink → push deleted=true + ok
+  // Le délai entre writes doit largement dépasser FS_AWAIT_WRITE_FINISH_MS
+  // (500ms) + le drain (~50ms) sinon chokidar regroupe en 1 seul event.
+  console.log("[smoke] triggering fs events (create → update → delete)…")
   const f1 = join(workspaceRoot, "smoke-add.md")
+
+  console.log("[smoke]   step 1: create")
   writeFileSync(f1, "hello smoke")
-  await wait(900) // > FS_AWAIT_WRITE_FINISH_MS
-  writeFileSync(f1, "hello smoke v2")
-  await wait(900)
+  await wait(2000)
+
+  console.log("[smoke]   step 2: update")
+  writeFileSync(f1, "hello smoke v2 — content updated")
+  await wait(2000)
+
+  console.log("[smoke]   step 3: delete")
   unlinkSync(f1)
-  await wait(900)
+  await wait(2000)
   console.log("[smoke] ✓ fs events emitted (check engine logs for [sync/watcher] entries)")
 
   console.log("[smoke] calling deactivate()…")
