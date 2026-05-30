@@ -152,6 +152,9 @@ declare global {
         | { state: "error"; message: string }
       >
       openLink?: (url: string) => void
+      // ─── Generic key-value persistent store via electron-store ────────
+      storeGet?: (name: string, key: string) => Promise<string | null>
+      storeSet?: (name: string, key: string, value: string) => Promise<void>
     }
   }
 }

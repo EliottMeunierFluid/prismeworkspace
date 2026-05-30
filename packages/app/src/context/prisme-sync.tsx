@@ -60,7 +60,16 @@ interface PrismeSyncStore {
   user: CurrentUser | null
   status: SyncEngineStatus
   workspaces: ConnectedWorkspace[]
+  /**
+   * Si true, le wizard de connexion s'ouvre automatiquement quand
+   * l'utilisateur ouvre un workspace pas encore connecté à un vault
+   * (Option A — opt-in volontaire dans Settings → Sync).
+   */
+  askOnOpen: boolean
 }
+
+const STORE_NAME = "opencode.settings"
+const STORE_KEY_ASK_ON_OPEN = "sync.askOnOpen"
 
 /**
  * Accès safe à window.api — en mode web (sans Electron) on retourne null
@@ -79,9 +88,33 @@ export const { use: usePrismeSync, provider: PrismeSyncProvider } = createSimple
       user: null,
       status: { state: "idle" },
       workspaces: [],
+      askOnOpen: false,
     })
 
     const [dialogTarget, setDialogTarget] = createSignal<ConnectDialogTarget | null>(null)
+
+    // ─── Setting persisté askOnOpen ─────────────────────────────────────
+    async function loadAskOnOpen(): Promise<void> {
+      const api = getApi()
+      if (!api?.storeGet) return
+      try {
+        const v = await api.storeGet(STORE_NAME, STORE_KEY_ASK_ON_OPEN)
+        setStore("askOnOpen", v === "true")
+      } catch {
+        setStore("askOnOpen", false)
+      }
+    }
+
+    async function setAskOnOpen(value: boolean): Promise<void> {
+      setStore("askOnOpen", value)
+      const api = getApi()
+      if (!api?.storeSet) return
+      try {
+        await api.storeSet(STORE_NAME, STORE_KEY_ASK_ON_OPEN, value ? "true" : "false")
+      } catch {
+        // silencieux — la valeur reste en mémoire jusqu'au prochain démarrage
+      }
+    }
 
     // ─── Fetch initial + polling ────────────────────────────────────────
     async function refreshUser(): Promise<void> {
@@ -127,7 +160,7 @@ export const { use: usePrismeSync, provider: PrismeSyncProvider } = createSimple
     }
 
     async function refreshAll(): Promise<void> {
-      await Promise.all([refreshUser(), refreshStatus(), refreshWorkspaces()])
+      await Promise.all([refreshUser(), refreshStatus(), refreshWorkspaces(), loadAskOnOpen()])
       setStore("ready", true)
     }
 
@@ -192,6 +225,7 @@ export const { use: usePrismeSync, provider: PrismeSyncProvider } = createSimple
       user: createMemo(() => store.user),
       status: createMemo(() => store.status),
       workspaces: createMemo(() => store.workspaces),
+      askOnOpen: createMemo(() => store.askOnOpen),
       dialogTarget,
       signIn,
       signOut,
@@ -200,6 +234,7 @@ export const { use: usePrismeSync, provider: PrismeSyncProvider } = createSimple
       closeConnectDialog,
       onConnected,
       refreshWorkspaces,
+      setAskOnOpen,
       isSyncingWorkspace(workspaceRoot: string): boolean {
         return store.workspaces.some((w) => w.workspaceRoot === workspaceRoot)
       },

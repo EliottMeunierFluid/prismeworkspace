@@ -13,6 +13,7 @@
  */
 
 import { Button } from "@opencode-ai/ui/button"
+import { Switch } from "@opencode-ai/ui/switch"
 import { For, Show, type Component } from "solid-js"
 import { useLanguage } from "@/context/language"
 import { usePrismeSync } from "@/context/prisme-sync"
@@ -94,6 +95,31 @@ export const SettingsSync: Component = () => {
           </Show>
         </SettingsList>
       </section>
+
+      {/* ─── Preferences (Option A toggle) ───────────────────── */}
+      <Show when={sync.user()}>
+        <section class="flex flex-col gap-2">
+          <h2 class="text-14-medium text-text-strong">
+            {language.t("settings.sync.preferences")}
+          </h2>
+          <SettingsList>
+            <div class="flex items-center justify-between gap-4 py-3">
+              <div class="flex flex-col min-w-0">
+                <span class="text-14-medium text-text-strong">
+                  {language.t("settings.sync.askOnOpen.title")}
+                </span>
+                <span class="text-12-regular text-text-weak">
+                  {language.t("settings.sync.askOnOpen.description")}
+                </span>
+              </div>
+              <Switch
+                checked={sync.askOnOpen()}
+                onChange={(checked) => void sync.setAskOnOpen(checked)}
+              />
+            </div>
+          </SettingsList>
+        </section>
+      </Show>
 
       {/* ─── Connected workspaces ────────────────────────────── */}
       <Show when={sync.user()}>

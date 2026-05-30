@@ -13,6 +13,7 @@ import { DialogSelectServer } from "@/components/dialog-select-server"
 import { useServer } from "@/context/server"
 import { useGlobalSync } from "@/context/global-sync"
 import { useLanguage } from "@/context/language"
+import { usePrismeSync } from "@/context/prisme-sync"
 
 export default function Home() {
   const sync = useGlobalSync()
@@ -22,6 +23,7 @@ export default function Home() {
   const navigate = useNavigate()
   const server = useServer()
   const language = useLanguage()
+  const prismeSync = usePrismeSync()
   const homedir = createMemo(() => sync.data.path.home)
   const recent = createMemo(() => {
     return sync.data.project
@@ -37,10 +39,31 @@ export default function Home() {
     return "bg-border-weak-base"
   })
 
+  function basename(path: string): string {
+    const parts = path.split(/[/\\]/).filter(Boolean)
+    return parts[parts.length - 1] ?? path
+  }
+
   function openProject(directory: string) {
     layout.projects.open(directory)
     server.projects.touch(directory)
     navigate(`/${base64Encode(directory)}`)
+
+    // Option A — si le user a opté pour le prompt d'activation sync :
+    //   - sync ready + user signedIn + setting askOnOpen on
+    //   - ce workspace pas déjà connecté à un vault
+    //   → ouvre le wizard pré-rempli
+    if (
+      prismeSync.ready() &&
+      prismeSync.user() &&
+      prismeSync.askOnOpen() &&
+      !prismeSync.isSyncingWorkspace(directory)
+    ) {
+      prismeSync.openConnectDialog({
+        workspaceRoot: directory,
+        workspaceName: basename(directory),
+      })
+    }
   }
 
   async function chooseProject() {
