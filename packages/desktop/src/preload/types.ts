@@ -103,6 +103,8 @@ export type ElectronAPI = {
       region: string
       quota_bytes: number
       crypto_version: number
+      /** Salt hex 64 chars (public — sert à dériver master_key côté client). */
+      salt: string
       size_bytes: number
       version: number
       created_at: string

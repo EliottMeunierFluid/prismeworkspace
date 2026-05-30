@@ -35,6 +35,8 @@ import { GlobalSyncProvider } from "@/context/global-sync"
 import { HighlightsProvider } from "@/context/highlights"
 import { LanguageProvider, type Locale, useLanguage } from "@/context/language"
 import { LayoutProvider } from "@/context/layout"
+import { PrismeSyncProvider } from "@/context/prisme-sync"
+import { PrismeSyncDialogHost } from "@/components/prisme-sync-dialog-host"
 import { ModelsProvider } from "@/context/models"
 import { NotificationProvider } from "@/context/notification"
 import { PermissionProvider } from "@/context/permission"
@@ -78,6 +80,78 @@ declare global {
     }
     api?: {
       setTitlebar?: (theme: { mode: "light" | "dark" }) => Promise<void>
+      // ─── Prisme Sync IPC (cf packages/desktop/src/preload/types.ts) ───
+      authSignIn?: () => Promise<{
+        ok: boolean
+        email?: string
+        plan?: "free" | "sync" | "team"
+        error?: string
+      }>
+      authSignOut?: () => Promise<void>
+      authCurrentUser?: () => Promise<{
+        email: string
+        plan: "free" | "sync" | "team"
+      } | null>
+      vaultsList?: () => Promise<
+        Array<{
+          id: string
+          name: string
+          owner_type: "personal" | "team" | "company"
+          region: string
+          quota_bytes: number
+          crypto_version: number
+          salt: string
+          size_bytes: number
+          version: number
+          created_at: string
+        }>
+      >
+      workspacesListConnected?: () => Promise<
+        Array<{
+          workspaceRoot: string
+          vaultId: string
+          vaultName: string
+          saltHex: string
+          connectedAt: string
+        }>
+      >
+      workspacesGetEntry?: (root: string) => Promise<
+        | {
+            workspaceRoot: string
+            vaultId: string
+            vaultName: string
+            saltHex: string
+            connectedAt: string
+          }
+        | undefined
+      >
+      syncConnect?: (args: {
+        workspaceRoot: string
+        vaultId: string
+        vaultName: string
+        saltHex: string
+        vaultPassword: string
+      }) => Promise<{
+        ok: boolean
+        error?: string
+        status:
+          | { state: "idle" }
+          | { state: "activating" }
+          | { state: "connecting" }
+          | { state: "ready"; vaultVersion: number }
+          | { state: "disconnected"; reason: string }
+          | { state: "error"; message: string }
+      }>
+      syncDisconnect?: (workspaceRoot: string) => Promise<void>
+      syncStatus?: () => Promise<
+        | { state: "idle" }
+        | { state: "activating" }
+        | { state: "connecting" }
+        | { state: "ready"; vaultVersion: number }
+        | { state: "disconnected"; reason: string }
+        | { state: "error"; message: string }
+      >
+      openLink?: (url: string) => void
     }
   }
 }
@@ -104,7 +178,10 @@ function AppShellProviders(props: ParentProps) {
             <ModelsProvider>
               <CommandProvider>
                 <HighlightsProvider>
-                  <Layout>{props.children}</Layout>
+                  <PrismeSyncProvider>
+                    <PrismeSyncDialogHost />
+                    <Layout>{props.children}</Layout>
+                  </PrismeSyncProvider>
                 </HighlightsProvider>
               </CommandProvider>
             </ModelsProvider>
