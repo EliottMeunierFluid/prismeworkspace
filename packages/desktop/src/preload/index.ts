@@ -72,6 +72,25 @@ const api: ElectronAPI = {
   checkUpdate: () => ipcRenderer.invoke("check-update"),
   installUpdate: () => ipcRenderer.invoke("install-update"),
   setBackgroundColor: (color: string) => ipcRenderer.invoke("set-background-color", color),
+
+  // ─── Sync (Prisme Workspace) ─────────────────────────────────────────
+  // cf packages/desktop/src/main/sync/ipc.ts + DESKTOP_UI_SYNC_INTEGRATION.md
+  authSignIn: () => ipcRenderer.invoke("auth:signIn"),
+  authSignOut: () => ipcRenderer.invoke("auth:signOut"),
+  authCurrentUser: () => ipcRenderer.invoke("auth:currentUser"),
+  vaultsList: () => ipcRenderer.invoke("vaults:list"),
+  workspacesListConnected: () => ipcRenderer.invoke("workspaces:listConnected"),
+  workspacesGetEntry: (root: string) => ipcRenderer.invoke("workspaces:getEntry", root),
+  syncConnect: (args: {
+    workspaceRoot: string
+    vaultId: string
+    vaultName: string
+    saltHex: string
+    vaultPassword: string
+  }) => ipcRenderer.invoke("sync:connect", args),
+  syncDisconnect: (workspaceRoot: string) =>
+    ipcRenderer.invoke("sync:disconnect", workspaceRoot),
+  syncStatus: () => ipcRenderer.invoke("sync:status"),
 }
 
 contextBridge.exposeInMainWorld("api", api)

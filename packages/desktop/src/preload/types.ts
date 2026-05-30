@@ -82,4 +82,75 @@ export type ElectronAPI = {
   checkUpdate: () => Promise<{ updateAvailable: boolean; version?: string }>
   installUpdate: () => Promise<void>
   setBackgroundColor: (color: string) => Promise<void>
+
+  // ─── Sync (Prisme Workspace) ─────────────────────────────────────────
+  authSignIn: () => Promise<{
+    ok: boolean
+    email?: string
+    plan?: "free" | "sync" | "team"
+    error?: string
+  }>
+  authSignOut: () => Promise<void>
+  authCurrentUser: () => Promise<{
+    email: string
+    plan: "free" | "sync" | "team"
+  } | null>
+  vaultsList: () => Promise<
+    Array<{
+      id: string
+      name: string
+      owner_type: "personal" | "team" | "company"
+      region: string
+      quota_bytes: number
+      crypto_version: number
+      size_bytes: number
+      version: number
+      created_at: string
+    }>
+  >
+  workspacesListConnected: () => Promise<
+    Array<{
+      workspaceRoot: string
+      vaultId: string
+      vaultName: string
+      saltHex: string
+      connectedAt: string
+    }>
+  >
+  workspacesGetEntry: (root: string) => Promise<
+    | {
+        workspaceRoot: string
+        vaultId: string
+        vaultName: string
+        saltHex: string
+        connectedAt: string
+      }
+    | undefined
+  >
+  syncConnect: (args: {
+    workspaceRoot: string
+    vaultId: string
+    vaultName: string
+    saltHex: string
+    vaultPassword: string
+  }) => Promise<{
+    ok: boolean
+    error?: string
+    status:
+      | { state: "idle" }
+      | { state: "activating" }
+      | { state: "connecting" }
+      | { state: "ready"; vaultVersion: number }
+      | { state: "disconnected"; reason: string }
+      | { state: "error"; message: string }
+  }>
+  syncDisconnect: (workspaceRoot: string) => Promise<void>
+  syncStatus: () => Promise<
+    | { state: "idle" }
+    | { state: "activating" }
+    | { state: "connecting" }
+    | { state: "ready"; vaultVersion: number }
+    | { state: "disconnected"; reason: string }
+    | { state: "error"; message: string }
+  >
 }
