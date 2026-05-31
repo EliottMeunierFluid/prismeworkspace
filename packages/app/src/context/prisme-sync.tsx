@@ -206,6 +206,46 @@ export const { use: usePrismeSync, provider: PrismeSyncProvider } = createSimple
       await refreshStatus()
     }
 
+    /**
+     * Tente une réactivation rapide d'un workspace en utilisant la masterKey
+     * stockée dans le keychain OS (skip scrypt). Retourne true si l'engine
+     * est passé en état `ready`, false sinon (raisons : pas de masterKey
+     * stockée, pas signedIn, erreur réseau...).
+     *
+     * Idempotent : si l'engine est déjà actif pour ce workspace, no-op.
+     */
+    async function tryReactivate(workspaceRoot: string): Promise<boolean> {
+      const api = getApi()
+      if (!api?.syncReactivate) return false
+      const currentStatus = store.status
+      // Déjà actif → rien à faire
+      if (currentStatus.state === "ready" || currentStatus.state === "activating" || currentStatus.state === "connecting") {
+        return currentStatus.state === "ready"
+      }
+      try {
+        const res = await api.syncReactivate(workspaceRoot)
+        setStore("status", res.status)
+        return res.ok
+      } catch {
+        return false
+      }
+    }
+
+    /**
+     * Indique si une masterKey est stockée dans le keychain pour ce workspace.
+     * Utilisé par l'UI pour différencier "Connect to sync" (rien en mémoire)
+     * de "Unlock to sync" (clé absente mais workspace dans registry).
+     */
+    async function hasStoredKey(workspaceRoot: string): Promise<boolean> {
+      const api = getApi()
+      if (!api?.syncHasStoredKey) return false
+      try {
+        return await api.syncHasStoredKey(workspaceRoot)
+      } catch {
+        return false
+      }
+    }
+
     function openConnectDialog(target: ConnectDialogTarget): void {
       setDialogTarget(target)
     }
@@ -230,6 +270,8 @@ export const { use: usePrismeSync, provider: PrismeSyncProvider } = createSimple
       signIn,
       signOut,
       disconnect,
+      tryReactivate,
+      hasStoredKey,
       openConnectDialog,
       closeConnectDialog,
       onConnected,

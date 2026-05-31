@@ -146,6 +146,18 @@ export type ElectronAPI = {
       | { state: "disconnected"; reason: string }
       | { state: "error"; message: string }
   }>
+  syncReactivate: (workspaceRoot: string) => Promise<{
+    ok: boolean
+    error?: string
+    status:
+      | { state: "idle" }
+      | { state: "activating" }
+      | { state: "connecting" }
+      | { state: "ready"; vaultVersion: number }
+      | { state: "disconnected"; reason: string }
+      | { state: "error"; message: string }
+  }>
+  syncHasStoredKey: (workspaceRoot: string) => Promise<boolean>
   syncDisconnect: (workspaceRoot: string) => Promise<void>
   syncStatus: () => Promise<
     | { state: "idle" }

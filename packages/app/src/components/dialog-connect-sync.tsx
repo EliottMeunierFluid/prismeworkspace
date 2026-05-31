@@ -54,31 +54,56 @@ export function DialogConnectSync(props: { target: ConnectDialogTarget }) {
   const language = useLanguage()
   const sync = usePrismeSync()
 
-  const initialStep = (): Step => (sync.user() ? "chooseVault" : "signIn")
+  /**
+   * Si le workspace est DÉJÀ dans le registry, on a déjà une association
+   * workspace → vault. On peut sauter le "choose vault" et aller direct à
+   * "unlock" (cas typique : auto-reactivate a échoué car masterKey absente
+   * du keychain, l'user clique l'indicateur orange pour ressaisir le password).
+   */
+  const existingEntry = (): { vaultId: string; vaultName: string; saltHex: string } | undefined => {
+    const e = sync.getWorkspaceEntry(props.target.workspaceRoot)
+    return e ? { vaultId: e.vaultId, vaultName: e.vaultName, saltHex: e.saltHex } : undefined
+  }
+
+  const initialStep = (): Step => {
+    if (!sync.user()) return "signIn"
+    if (existingEntry()) return "unlock"
+    return "chooseVault"
+  }
+
   const [step, setStep] = createSignal<Step>(initialStep())
   const [vaults, setVaults] = createSignal<Vault[]>([])
-  const [selectedVaultId, setSelectedVaultId] = createSignal<string | null>(null)
+  const [selectedVaultId, setSelectedVaultId] = createSignal<string | null>(
+    existingEntry()?.vaultId ?? null,
+  )
   const [password, setPassword] = createSignal("")
   const [signingIn, setSigningIn] = createSignal(false)
   const [loadingVaults, setLoadingVaults] = createSignal(false)
   const [error, setError] = createSignal<string | null>(null)
 
-  // Quand un user vient d'être signé in, passe automatiquement à chooseVault
+  // Quand un user vient d'être signé in, passe automatiquement à l'étape suivante
   createEffect(() => {
     if (sync.user() && step() === "signIn" && !signingIn()) {
-      setStep("chooseVault")
+      setStep(existingEntry() ? "unlock" : "chooseVault")
     }
   })
 
   // Charge les vaults dès qu'on entre dans chooseVault
+  // ET aussi quand on est en unlock direct (pour récupérer le nom + salt du vault)
   createEffect(() => {
-    if (step() === "chooseVault" && vaults().length === 0 && !loadingVaults()) {
+    if (
+      (step() === "chooseVault" || step() === "unlock") &&
+      vaults().length === 0 &&
+      !loadingVaults()
+    ) {
       void loadVaults()
     }
   })
 
   onMount(() => {
-    if (sync.user() && step() === "signIn") setStep("chooseVault")
+    if (sync.user() && step() === "signIn") {
+      setStep(existingEntry() ? "unlock" : "chooseVault")
+    }
   })
 
   async function loadVaults(): Promise<void> {
@@ -131,13 +156,17 @@ export function DialogConnectSync(props: { target: ConnectDialogTarget }) {
     e.preventDefault()
     const vaultId = selectedVaultId()
     if (!vaultId) return
-    const vault = vaults().find((v) => v.id === vaultId)
-    if (!vault) return
     const api = getApi()
     if (!api?.syncConnect) return
 
-    // saltHex inclus dans GET /api/vaults (cf branche feat/oauth-desktop ③).
-    const saltHex = vault.salt
+    // Récupère les méta du vault : soit depuis le registry local (cas
+    // re-unlock d'un workspace déjà connecté), soit depuis la liste API
+    // (cas connexion initiale).
+    const fromRegistry = sync.getWorkspaceEntry(props.target.workspaceRoot)
+    const fromList = vaults().find((v) => v.id === vaultId)
+    const saltHex = fromList?.salt ?? fromRegistry?.saltHex
+    const vaultName = fromList?.name ?? fromRegistry?.vaultName ?? ""
+
     if (!saltHex) {
       setError(language.t("dialog.connectSync.error.saltMissing"))
       setStep("error")
@@ -150,7 +179,7 @@ export function DialogConnectSync(props: { target: ConnectDialogTarget }) {
       const res = await api.syncConnect({
         workspaceRoot: props.target.workspaceRoot,
         vaultId,
-        vaultName: vault.name,
+        vaultName,
         saltHex,
         vaultPassword: password(),
       })
@@ -265,7 +294,10 @@ export function DialogConnectSync(props: { target: ConnectDialogTarget }) {
             <form onSubmit={handleUnlockAndConnect} class="flex flex-col gap-3">
               <div class="text-14-regular text-text">
                 {language.t("dialog.connectSync.step3.description", {
-                  vault: vaults().find((v) => v.id === selectedVaultId())?.name ?? "",
+                  vault:
+                    vaults().find((v) => v.id === selectedVaultId())?.name ??
+                    existingEntry()?.vaultName ??
+                    "",
                 })}
               </div>
               <div class="text-12-regular text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">

@@ -49,7 +49,13 @@ import { SyncEngine, type SyncConfig, type SyncStatus } from "./engine"
 import { startAuthFlow } from "./auth-flow"
 import { clearAuthToken, getCurrentUser, loadAuthToken } from "./auth"
 import { listVaults, type VaultListItem } from "./api"
-import { clearAllMasterKeys, clearMasterKey } from "./key-storage"
+import {
+  clearAllMasterKeys,
+  clearMasterKey,
+  loadMasterKey,
+  storeMasterKey,
+} from "./key-storage"
+import { getActiveKeys } from "./keys"
 import {
   addOrUpdateWorkspace,
   clearAllWorkspaces,
@@ -175,10 +181,8 @@ export function registerSyncIpcHandlers(): void {
         }
       }
 
-      // Active l'engine. L'engine dérivera lui-même la master_key via scrypt
-      // depuis (vaultPassword, saltHex) et vérifiera le keyhash contre le
-      // serveur au handshake init. La persistance keychain est out-of-scope v1
-      // (ressaisie du password à chaque démarrage — cf DESKTOP_UI_SYNC_INTEGRATION.md Q3).
+      // Active l'engine — dérive master_key via scrypt en interne et vérifie
+      // le keyhash contre le serveur au handshake init.
       const eng = getEngine()
       try {
         await eng.activate({
@@ -195,7 +199,19 @@ export function registerSyncIpcHandlers(): void {
         return { ok: false, error: message, status: eng.getStatus() }
       }
 
-      // 4. Enregistre dans le registry
+      // Persiste la master_key dans le keychain OS pour permettre la
+      // réactivation automatique au prochain démarrage (sync:reactivate).
+      // Non-fatal si safeStorage indispo : l'utilisateur ressaisira le
+      // password.
+      try {
+        const keys = getActiveKeys(vaultId)
+        storeMasterKey(vaultId, keys.masterKey)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        log.warn("[sync/ipc] storeMasterKey failed (non-fatal)", { message })
+      }
+
+      // Enregistre dans le registry pour l'UI Settings → Sync.
       addOrUpdateWorkspace({
         workspaceRoot,
         vaultId,
@@ -205,6 +221,67 @@ export function registerSyncIpcHandlers(): void {
       })
 
       return { ok: true, status: eng.getStatus() }
+    },
+  )
+
+  // ─── Réactivation auto (masterKey persistée → skip scrypt) ───────────
+  ipcMain.handle(
+    "sync:reactivate",
+    async (_e, workspaceRoot: string): Promise<ConnectResult> => {
+      log.info("[sync/ipc] sync:reactivate", { workspaceRoot })
+
+      const entry = getWorkspaceEntry(workspaceRoot)
+      if (!entry) {
+        return {
+          ok: false,
+          error: "This workspace is not in the sync registry",
+          status: { state: "idle" },
+        }
+      }
+      const token = loadAuthToken()
+      if (!token) {
+        return {
+          ok: false,
+          error: "Not signed in. Please sign in first.",
+          status: { state: "idle" },
+        }
+      }
+      const masterKey = loadMasterKey(entry.vaultId)
+      if (!masterKey) {
+        return {
+          ok: false,
+          error: "Encryption key not stored. Please unlock the vault with your password.",
+          status: { state: "idle" },
+        }
+      }
+
+      const eng = getEngine()
+      try {
+        await eng.activate({
+          workspaceRoot: entry.workspaceRoot,
+          vaultId: entry.vaultId,
+          syncToken: token,
+          wsUrl: defaultWsUrl(),
+          precomputedMasterKey: masterKey,
+          saltHex: entry.saltHex,
+        })
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        log.warn("[sync/ipc] sync:reactivate activate failed", { message })
+        return { ok: false, error: message, status: eng.getStatus() }
+      }
+
+      return { ok: true, status: eng.getStatus() }
+    },
+  )
+
+  // ─── Has stored master_key (UI hint pour différencier les états) ─────
+  ipcMain.handle(
+    "sync:hasStoredKey",
+    (_e, workspaceRoot: string): boolean => {
+      const entry = getWorkspaceEntry(workspaceRoot)
+      if (!entry) return false
+      return loadMasterKey(entry.vaultId) !== null
     },
   )
 

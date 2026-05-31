@@ -943,6 +943,7 @@ export const dict = {
 
   "header.sync.notSynced": "Activer la sync",
   "header.sync.signingIn": "Connexion…",
+  "header.sync.unlockRequired": "Déverrouiller la sync",
   "header.sync.connecting": "Connexion…",
   "header.sync.synced": "Synchronisé",
   "header.sync.syncing": "Synchronisation…",

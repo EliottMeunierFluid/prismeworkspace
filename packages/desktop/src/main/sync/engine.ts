@@ -31,6 +31,7 @@ import type {
 import { CRYPTO_VERSION, PERIODIC_SWEEP_INTERVAL_MS } from "./constants"
 import {
   activateKeys,
+  activateKeysFromMasterKey,
   deactivateKeys,
   getActiveKeys,
   hasActiveKeys,
@@ -78,9 +79,22 @@ export interface SyncConfig {
   wsUrl?: string
   /** Bearer JWT obtenu via /api/auth/sync-token côté site SaaS. */
   syncToken: string
-  /** Mot de passe E2EE du vault — utilisé une fois pour dériver les clés,
-   *  puis OUBLIÉ. Ne JAMAIS persister, ne JAMAIS logger. */
-  vaultPassword: string
+  /**
+   * Mot de passe E2EE du vault — utilisé une fois pour dériver les clés,
+   * puis OUBLIÉ. Ne JAMAIS persister, ne JAMAIS logger.
+   *
+   * Soit `vaultPassword`, soit `precomputedMasterKey` doit être fourni :
+   *  - vaultPassword → dérivation complète via scrypt (~50-150ms)
+   *  - precomputedMasterKey → skip scrypt, refait juste HKDF (~1-5ms).
+   *    Utilisé pour la réactivation automatique avec masterKey lue depuis
+   *    le keychain OS (cf KEYCHAIN_OS.md).
+   */
+  vaultPassword?: string
+  /**
+   * Alternative à vaultPassword : 32 bytes masterKey précédemment dérivés
+   * via scrypt et stockés dans le keychain. Skip la dérivation coûteuse.
+   */
+  precomputedMasterKey?: Buffer
   /** salt hex (32B) issu de la création du vault côté site SaaS. */
   saltHex: string
 }
@@ -169,18 +183,35 @@ export class SyncEngine {
       vaultId: config.vaultId,
       wsUrl: config.wsUrl ?? "(via siteUrl)",
       siteUrl: config.siteUrl,
-      // SECURITY: pas de log de vaultPassword, syncToken, saltHex.
+      mode: config.precomputedMasterKey ? "from_master_key" : "from_password",
+      // SECURITY: pas de log de vaultPassword, syncToken, saltHex, masterKey.
     })
     this.status = { state: "activating" }
 
-    // 1. Dérivation clés crypto (~50-150ms). SECURITY: le password est passé
-    //    par valeur ici, et n'est jamais réutilisé après activateKeys.
+    // 1. Dérivation clés crypto. SECURITY : ni le password ni la masterKey
+    //    ne sont réutilisés après activateKeys / activateKeysFromMasterKey.
     const saltBuffer = Buffer.from(config.saltHex, "hex")
     if (saltBuffer.length !== 32) {
       this.status = { state: "error", message: `Invalid salt length: ${saltBuffer.length} (expected 32)` }
       throw new Error(this.status.message)
     }
-    const { keyhash } = activateKeys(config.vaultPassword, saltBuffer, config.vaultId)
+    let keyhash: Buffer
+    if (config.precomputedMasterKey) {
+      // Réactivation rapide via masterKey persistée — skip scrypt (~1-5ms)
+      if (config.precomputedMasterKey.length !== 32) {
+        this.status = { state: "error", message: `Invalid masterKey length: ${config.precomputedMasterKey.length} (expected 32)` }
+        throw new Error(this.status.message)
+      }
+      const res = activateKeysFromMasterKey(config.precomputedMasterKey, saltBuffer, config.vaultId)
+      keyhash = res.keyhash
+    } else if (config.vaultPassword) {
+      // Activation initiale via scrypt (~50-150ms)
+      const res = activateKeys(config.vaultPassword, saltBuffer, config.vaultId)
+      keyhash = res.keyhash
+    } else {
+      this.status = { state: "error", message: "Either vaultPassword or precomputedMasterKey must be provided" }
+      throw new Error(this.status.message)
+    }
     const keyhashHex = keyhash.toString("hex")
 
     // 2. Ouvre / crée la DB locale.

@@ -13,7 +13,11 @@
  *   de sécurité.
  */
 
-import { deriveVaultKeys, type VaultKeys } from "@prisme/sync-crypto"
+import {
+  deriveVaultKeys,
+  deriveVaultKeysFromMasterKey,
+  type VaultKeys,
+} from "@prisme/sync-crypto"
 import log from "electron-log"
 
 /**
@@ -43,7 +47,7 @@ export function activateKeys(
   vaultPassword: string,
   saltBuffer: Buffer,
   vaultId: string,
-): { keyhash: Buffer } {
+): { keyhash: Buffer; masterKey: Buffer } {
   // SECURITY: pas de log de vaultPassword ni de saltBuffer ici.
   const keys = deriveVaultKeys(vaultPassword, saltBuffer)
   activeKeys = { vaultId, keys }
@@ -51,6 +55,35 @@ export function activateKeys(
     vaultId,
     // On log SEULEMENT le préfixe du keyhash pour debug (8 chars hex = 4 bytes,
     // pas de risque crypto). On ne log pas masterKey/keyContent/keyPathMac/keyPathEnc.
+    keyhashPrefix: keys.keyhash.subarray(0, 4).toString("hex"),
+  })
+  // On retourne masterKey en plus pour permettre au caller de la persister
+  // dans le keychain OS (cf key-storage.ts). C'est OK car la masterKey ne
+  // quitte pas le process main → on assume que le caller est responsable.
+  return { keyhash: keys.keyhash, masterKey: keys.masterKey }
+}
+
+/**
+ * Variante : (ré)active les clés à partir d'une masterKey précalculée.
+ *
+ * Permet d'éviter le scrypt coûteux quand la masterKey a déjà été dérivée
+ * dans une session précédente et stockée dans le keychain OS.
+ *
+ * SECURITY identique à activateKeys — pas de log de masterKey/sub-keys.
+ *
+ * @param masterKey 32 bytes lus depuis le keychain via key-storage.loadMasterKey.
+ * @param saltBuffer 32 bytes (récupérés depuis le serveur via /api/vaults).
+ * @param vaultId UUID du vault.
+ */
+export function activateKeysFromMasterKey(
+  masterKey: Buffer,
+  saltBuffer: Buffer,
+  vaultId: string,
+): { keyhash: Buffer } {
+  const keys = deriveVaultKeysFromMasterKey(masterKey, saltBuffer)
+  activeKeys = { vaultId, keys }
+  log.info("[sync/keys] activated (from precomputed masterKey)", {
+    vaultId,
     keyhashPrefix: keys.keyhash.subarray(0, 4).toString("hex"),
   })
   return { keyhash: keys.keyhash }
