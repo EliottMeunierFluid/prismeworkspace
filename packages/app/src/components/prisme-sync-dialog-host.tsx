@@ -10,7 +10,7 @@
  * Ce composant ne rend rien visuellement.
  */
 
-import { createEffect } from "solid-js"
+import { createEffect, untrack } from "solid-js"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { usePrismeSync } from "@/context/prisme-sync"
 import { DialogConnectSync } from "./dialog-connect-sync"
@@ -19,11 +19,19 @@ export function PrismeSyncDialogHost() {
   const dialog = useDialog()
   const sync = usePrismeSync()
 
+  let lastShown: object | null = null
+
   createEffect(() => {
     const target = sync.dialogTarget()
-    if (target) {
-      dialog.show(() => <DialogConnectSync target={target} />)
+    if (!target) {
+      lastShown = null
+      return
     }
+    if (target === lastShown) return
+    lastShown = target
+    untrack(() => {
+      dialog.show(() => <DialogConnectSync target={target} />)
+    })
   })
 
   return null

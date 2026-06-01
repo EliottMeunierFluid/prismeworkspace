@@ -79,6 +79,7 @@ export function DialogConnectSync(props: { target: ConnectDialogTarget }) {
   const [password, setPassword] = createSignal("")
   const [signingIn, setSigningIn] = createSignal(false)
   const [loadingVaults, setLoadingVaults] = createSignal(false)
+  const [vaultsFetched, setVaultsFetched] = createSignal(false)
   const [error, setError] = createSignal<string | null>(null)
 
   // Quand un user vient d'être signé in, passe automatiquement à l'étape suivante
@@ -93,7 +94,7 @@ export function DialogConnectSync(props: { target: ConnectDialogTarget }) {
   createEffect(() => {
     if (
       (step() === "chooseVault" || step() === "unlock") &&
-      vaults().length === 0 &&
+      !vaultsFetched() &&
       !loadingVaults()
     ) {
       void loadVaults()
@@ -119,6 +120,7 @@ export function DialogConnectSync(props: { target: ConnectDialogTarget }) {
       setError(language.t("dialog.connectSync.error.loadVaults", { error: msg }))
     } finally {
       setLoadingVaults(false)
+      setVaultsFetched(true)
     }
   }
 
