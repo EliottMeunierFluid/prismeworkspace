@@ -37,7 +37,7 @@ export const FS_AWAIT_WRITE_FINISH_MS = 500
 export const PERIODIC_SWEEP_INTERVAL_MS = 15 * 60 * 1000 // 15 minutes
 
 /** Patterns à exclure du watcher (en plus des défauts chokidar). */
-export const FS_IGNORED_PATTERNS = [/\.prisma-sync/, /\.git/, /node_modules/]
+export const FS_IGNORED_PATTERNS = [/\.prisme-sync/, /\.git/, /node_modules/]
 
 // ─── Crypto / payload ───────────────────────────────────────────────────────
 /** Version byte attendue/produite. Cf @prisme/sync-crypto VERSION_BYTE. */
@@ -45,7 +45,7 @@ export const CRYPTO_VERSION = 1
 
 // ─── Chemins locaux ─────────────────────────────────────────────────────────
 /** Dossier de configuration sync par workspace (à la racine du workspace). */
-export const SYNC_CONFIG_DIRNAME = ".prisma-sync"
+export const SYNC_CONFIG_DIRNAME = ".prisme-sync"
 
 /** Nom du fichier SQLite de state. */
 export const SYNC_STATE_DB_FILENAME = "state.db"

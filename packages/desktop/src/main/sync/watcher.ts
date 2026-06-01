@@ -6,7 +6,7 @@
  * Session A scope :
  *   - Détecte add / change / unlink / addDir / unlinkDir via chokidar
  *   - Debounce stabilité fichier (FS_AWAIT_WRITE_FINISH_MS)
- *   - Ignore .prisma-sync, .git, node_modules (cf FS_IGNORED_PATTERNS)
+ *   - Ignore .prisme-sync, .git, node_modules (cf FS_IGNORED_PATTERNS)
  *   - LOG les events. Pas de pipeline push/encrypt — branché en Session B.
  *
  * Le watcher est démarré après le `ready` du handshake (cf engine.ts) pour ne
@@ -54,7 +54,7 @@ function toRelativeSlash(workspaceRoot: string, absolute: string): string {
  * Démarre un watcher sur workspaceRoot.
  *
  * Filtres :
- *  - ignored : cf FS_IGNORED_PATTERNS (.prisma-sync / .git / node_modules)
+ *  - ignored : cf FS_IGNORED_PATTERNS (.prisme-sync / .git / node_modules)
  *  - awaitWriteFinish : attend FS_AWAIT_WRITE_FINISH_MS de stabilité avant de
  *    déclencher un `add`/`change` (gère les éditeurs qui font tempfile+rename)
  *  - ignoreInitial : true — on ne re-traite pas les fichiers existants au

@@ -3,7 +3,7 @@
  *
  * Source de vérité : docs/SYNC_ARCHITECTURE_SPEC.md §4.2 + BRIEF_BLOC_1 §4.1.
  *
- * Convention : DB locale à `<workspace_root>/.prisma-sync/state.db`. Une DB
+ * Convention : DB locale à `<workspace_root>/.prisme-sync/state.db`. Une DB
  * par workspace. Pas de mutualisation entre workspaces — c'est un choix.
  *
  * SECURITY : ne JAMAIS stocker password ni clés dérivées dans cette DB.
@@ -11,20 +11,17 @@
  * pour pouvoir re-dériver les clés au login.
  */
 
-import { mkdirSync, readFileSync } from "node:fs"
-import { dirname, join } from "node:path"
-import { fileURLToPath } from "node:url"
+import { mkdirSync } from "node:fs"
+import { join } from "node:path"
 import Database from "better-sqlite3"
 import log from "electron-log"
 import {
   SYNC_CONFIG_DIRNAME,
   SYNC_STATE_DB_FILENAME,
 } from "../constants"
-
-const SCHEMA_PATH = join(
-  dirname(fileURLToPath(import.meta.url)),
-  "schema.sql",
-)
+// Le schema SQL est embarqué dans le bundle main via l'import Vite ?raw —
+// évite de devoir copier schema.sql à côté de index.js après chaque build.
+import SCHEMA_SQL from "./schema.sql?raw"
 
 // ─── Types data JSON stockés ────────────────────────────────────────────────
 
@@ -73,7 +70,7 @@ export interface SyncStateDb {
 /**
  * Ouvre (ou crée) la DB SQLite du workspace donné.
  *
- * Crée `<workspace_root>/.prisma-sync/state.db` si absent, applique le schema.
+ * Crée `<workspace_root>/.prisme-sync/state.db` si absent, applique le schema.
  */
 export function openStateDb(workspaceRoot: string): SyncStateDb {
   const dir = join(workspaceRoot, SYNC_CONFIG_DIRNAME)
@@ -85,8 +82,7 @@ export function openStateDb(workspaceRoot: string): SyncStateDb {
   db.pragma("journal_mode = WAL")
   db.pragma("foreign_keys = ON")
 
-  const schema = readFileSync(SCHEMA_PATH, "utf8")
-  db.exec(schema)
+  db.exec(SCHEMA_SQL)
 
   // ─── Prepared statements ─────────────────────────────────────────────────
   const stmts = {

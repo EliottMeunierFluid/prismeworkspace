@@ -438,7 +438,7 @@ export function sha256Hex(buf: Buffer): string {
 
 /**
  * Met à jour la base ancestor cache après un push réussi (Étape 44).
- * Le fichier vivant à `<workspaceRoot>/.prisma-sync/base/<sha256(path).hex>`
+ * Le fichier vivant à `<workspaceRoot>/.prisme-sync/base/<sha256(path).hex>`
  * est la référence pour un futur merge 3-way si conflit pull entrant.
  */
 async function writeBaseCache(

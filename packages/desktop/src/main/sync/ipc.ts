@@ -184,6 +184,14 @@ export function registerSyncIpcHandlers(): void {
       // Active l'engine — dérive master_key via scrypt en interne et vérifie
       // le keyhash contre le serveur au handshake init.
       const eng = getEngine()
+      // Reset si l'engine est resté dans un état non-idle suite à un précédent
+      // échec (ex: handshake 4001 keyhash mismatch). activate() exige `idle`.
+      if (eng.getStatus().state !== "idle") {
+        log.info("[sync/ipc] sync:connect resetting engine before activate", {
+          previousState: eng.getStatus().state,
+        })
+        await eng.deactivate()
+      }
       try {
         await eng.activate({
           workspaceRoot,
@@ -256,6 +264,12 @@ export function registerSyncIpcHandlers(): void {
       }
 
       const eng = getEngine()
+      if (eng.getStatus().state !== "idle") {
+        log.info("[sync/ipc] sync:reactivate resetting engine before activate", {
+          previousState: eng.getStatus().state,
+        })
+        await eng.deactivate()
+      }
       try {
         await eng.activate({
           workspaceRoot: entry.workspaceRoot,

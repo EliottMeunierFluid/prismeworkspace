@@ -122,9 +122,9 @@ describe("sync sweep", () => {
     expect(db.getLocalFile("a.md")).toBeUndefined()
   })
 
-  test("ignore .prisma-sync et .git", async () => {
-    mkdirSync(join(dir, ".prisma-sync"), { recursive: true })
-    writeFileSync(join(dir, ".prisma-sync/state.db"), "x")
+  test("ignore .prisme-sync et .git", async () => {
+    mkdirSync(join(dir, ".prisme-sync"), { recursive: true })
+    writeFileSync(join(dir, ".prisme-sync/state.db"), "x")
     mkdirSync(join(dir, ".git"), { recursive: true })
     writeFileSync(join(dir, ".git/HEAD"), "ref: refs/heads/main")
     writeFileSync(join(dir, "real.md"), "hello")

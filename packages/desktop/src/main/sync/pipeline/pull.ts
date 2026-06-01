@@ -313,7 +313,7 @@ async function tryMerge3Way(
   return merge3Way(base.toString("utf8"), local.toString("utf8"), remoteContent.toString("utf8"))
 }
 
-/** Chemin du fichier base cache : `<workspaceRoot>/.prisma-sync/base/<sha256(path).hex>`. */
+/** Chemin du fichier base cache : `<workspaceRoot>/.prisme-sync/base/<sha256(path).hex>`. */
 function baseCachePath(workspaceRoot: string, relPath: string): string {
   const hashed = createHash("sha256").update(relPath).digest("hex")
   return join(workspaceRoot, SYNC_CONFIG_DIRNAME, "base", hashed)
@@ -351,7 +351,7 @@ async function preserveLocalAsConflictCopy(
  * Évite qu'un éditeur ouvert sur le fichier voie un état partiel.
  */
 async function atomicWrite(absPath: string, data: Buffer): Promise<void> {
-  const tmp = `${absPath}.prisma-sync.${Date.now()}.tmp`
+  const tmp = `${absPath}.prisme-sync.${Date.now()}.tmp`
   await writeFile(tmp, data)
   await rename(tmp, absPath)
 }

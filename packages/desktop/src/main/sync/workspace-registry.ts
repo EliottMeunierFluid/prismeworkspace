@@ -5,7 +5,7 @@
  * pour pouvoir lister les workspaces connectés depuis Settings → Sync, et
  * réactiver automatiquement la sync au démarrage.
  *
- * NB : la même info existe déjà dans `<workspaceRoot>/.prisma-sync/state.db`
+ * NB : la même info existe déjà dans `<workspaceRoot>/.prisme-sync/state.db`
  * (table meta). Cette registry-ci est une vue agrégée à l'échelle de l'install
  * pour ne pas avoir à ouvrir N state.db pour la liste UI.
  */

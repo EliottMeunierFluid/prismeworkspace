@@ -47,11 +47,11 @@ describe("sync watcher", () => {
     expect(unlink).toBeDefined()
   })
 
-  test("ignores .prisma-sync subdirectory", async () => {
-    mkdirSync(join(dir, ".prisma-sync"), { recursive: true })
-    writeFileSync(join(dir, ".prisma-sync", "state.db"), "fake")
+  test("ignores .prisme-sync subdirectory", async () => {
+    mkdirSync(join(dir, ".prisme-sync"), { recursive: true })
+    writeFileSync(join(dir, ".prisme-sync", "state.db"), "fake")
     await wait(SETTLE_MS)
-    const leaked = events.find((e) => e.path.startsWith(".prisma-sync"))
+    const leaked = events.find((e) => e.path.startsWith(".prisme-sync"))
     expect(leaked).toBeUndefined()
   })
 })

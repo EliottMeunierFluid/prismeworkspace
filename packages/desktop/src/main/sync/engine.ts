@@ -7,7 +7,7 @@
  * Session A scope (étapes 22-29) :
  *   activate() :
  *     1. activateKeys(password, salt) → masterKey/keyContent/keyPathMac/keyPathEnc en RAM
- *     2. openStateDb(workspaceRoot) → SQLite .prisma-sync/state.db
+ *     2. openStateDb(workspaceRoot) → SQLite .prisme-sync/state.db
  *     3. setMeta { vault_id, device_id, salt, keyhash } si pas déjà initialisé
  *     4. createWsClient(wsUrl, syncToken).connect()
  *     5. on open → sendJson({op:'init', vault_id, keyhash, vault_version,
