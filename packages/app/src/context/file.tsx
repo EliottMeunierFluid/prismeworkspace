@@ -73,7 +73,11 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
     const tree = createFileTreeStore({
       scope,
       normalizeDir: path.normalizeDir,
-      list: (dir) => sdk.client.file.list({ path: dir }).then((x) => x.data ?? []),
+      // Prisme: filtre les dossiers techniques de la sync E2EE.
+      list: (dir) =>
+        sdk.client.file.list({ path: dir }).then((x) =>
+          (x.data ?? []).filter((node) => node.name !== ".prisme-sync"),
+        ),
       onError: (message) => {
         showToast({
           variant: "error",
