@@ -977,6 +977,10 @@ export const dict = {
   "dialog.connectSync.step3.warning": "Sans ce mot de passe, tes fichiers sont irrécupérables — nous ne pouvons pas le retrouver pour toi.",
   "dialog.connectSync.step3.passwordPlaceholder": "Mot de passe du vault",
   "dialog.connectSync.step3.cta": "Déverrouiller et synchroniser",
+  "dialog.connectSync.step3.title_v2": "Ouvrir {{vault}}",
+  "dialog.connectSync.step3.subtitle_v2": "Saisis le mot de passe de ton compte Prisme pour déverrouiller tes clés.",
+  "dialog.connectSync.step3.warning_v2": "Avec le key wrapping v2, ton vault est déchiffré localement via ton compte. Tu n'as qu'un seul mot de passe à retenir — celui-ci. S'il est perdu, tes fichiers sont irrécupérables.",
+  "dialog.connectSync.step3.passwordPlaceholder_v2": "Mot de passe du compte",
 
   "dialog.connectSync.connecting.title": "Connexion en cours…",
   "dialog.connectSync.connecting.subtitle": "Dérivation des clés et handshake avec le serveur.",

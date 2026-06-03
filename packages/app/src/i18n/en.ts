@@ -1067,6 +1067,10 @@ export const dict = {
   "dialog.connectSync.step3.warning": "Without this password, your files cannot be decrypted — we can't recover it for you.",
   "dialog.connectSync.step3.passwordPlaceholder": "Vault password",
   "dialog.connectSync.step3.cta": "Unlock & sync",
+  "dialog.connectSync.step3.title_v2": "Open {{vault}}",
+  "dialog.connectSync.step3.subtitle_v2": "Enter your Prisme account password to unlock your keys.",
+  "dialog.connectSync.step3.warning_v2": "With key wrapping v2, your vault is decrypted locally via your account. You only have one password to remember — this one. If you lose it, your files are unrecoverable.",
+  "dialog.connectSync.step3.passwordPlaceholder_v2": "Account password",
 
   "dialog.connectSync.connecting.title": "Connecting…",
   "dialog.connectSync.connecting.subtitle": "Deriving keys and handshaking with the server.",
