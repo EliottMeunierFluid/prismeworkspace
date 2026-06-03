@@ -796,7 +796,7 @@ export function SessionSidePanel(props: {
                 class="h-full flex flex-col overflow-hidden group/filetree"
                 classList={{ "border-l border-border-weaker-base": reviewOpen() }}
               >
-                <div class="h-full bg-background-stronger px-3 py-0" data-scope="filetree">
+                <div class="h-full min-h-0 overflow-y-auto bg-background-stronger px-3 py-0" data-scope="filetree">
                   <Switch>
                     <Match when={nofiles()}>{empty(language.t("session.files.empty"))}</Match>
                     <Match when={true}>
