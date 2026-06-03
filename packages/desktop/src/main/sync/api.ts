@@ -114,3 +114,71 @@ export async function getVaultAccess(
   })
   return (await res.json()) as VaultAccessResponse
 }
+
+/**
+ * Membership v2.0 : `encrypted_master_key` (sealed box) + méta du vault.
+ * Renvoyé par GET /api/vaults/:id/membership. Le client unwrap localement
+ * avec sa privateKey Curve25519 pour obtenir la masterKey en clair.
+ */
+export interface VaultMembership {
+  vault_id: string
+  user_id: string
+  encrypted_master_key_hex: string
+  role: "admin" | "member"
+  added_at: string
+  vault: {
+    id: string
+    name: string
+    owner_type: "personal" | "team" | "company"
+    crypto_version: number
+    salt_hex: string
+    keyhash_hex: string
+  }
+}
+
+/**
+ * Récupère le membership de l'utilisateur courant pour un vault v2.0.
+ * Renvoie `encrypted_master_key` (sealed box) + méta nécessaires à l'engine.
+ *
+ * 404 si l'user n'est pas membre, le vault n'existe pas, ou est deleted.
+ */
+export async function getVaultMembership(
+  vaultId: string,
+): Promise<VaultMembership> {
+  log.info("[sync/api] GET /api/vaults/:id/membership", { vaultId })
+  const res = await authFetch(`/api/vaults/${vaultId}/membership`)
+  return (await res.json()) as VaultMembership
+}
+
+/**
+ * Méta crypto du user courant (keypair Curve25519 chiffré par account_kek).
+ * Renvoyé par GET /api/auth/me, utilisé pour reconstruire la privateKey à
+ * partir du password compte.
+ */
+export interface AccountCryptoMeta {
+  public_key_hex: string
+  encrypted_private_key_hex: string
+  private_key_salt_hex: string
+  private_key_nonce_hex: string
+}
+
+export interface CurrentUserResponse {
+  id: string
+  email: string
+  plan: "free" | "sync" | "team"
+  display_name: string | null
+  crypto: AccountCryptoMeta | null
+}
+
+/**
+ * Récupère le profil + méta crypto du user courant.
+ *
+ * `crypto: null` = compte legacy pré-v2.0 sans keypair (cas désormais
+ * inexistant en prod, décision "pas de migration utilisateur" actée
+ * 2026-06-02).
+ */
+export async function getCurrentUserProfile(): Promise<CurrentUserResponse> {
+  log.info("[sync/api] GET /api/auth/me")
+  const res = await authFetch("/api/auth/me")
+  return (await res.json()) as CurrentUserResponse
+}

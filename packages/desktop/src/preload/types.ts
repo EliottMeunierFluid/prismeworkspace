@@ -146,6 +146,22 @@ export type ElectronAPI = {
       | { state: "disconnected"; reason: string }
       | { state: "error"; message: string }
   }>
+  syncConnectV2: (args: {
+    workspaceRoot: string
+    vaultId: string
+    vaultName: string
+    accountPassword: string
+  }) => Promise<{
+    ok: boolean
+    error?: string
+    status:
+      | { state: "idle" }
+      | { state: "activating" }
+      | { state: "connecting" }
+      | { state: "ready"; vaultVersion: number }
+      | { state: "disconnected"; reason: string }
+      | { state: "error"; message: string }
+  }>
   syncReactivate: (workspaceRoot: string) => Promise<{
     ok: boolean
     error?: string

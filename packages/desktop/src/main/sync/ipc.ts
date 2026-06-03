@@ -49,6 +49,7 @@ import { SyncEngine, type SyncConfig, type SyncStatus } from "./engine"
 import { startAuthFlow } from "./auth-flow"
 import { clearAuthToken, getCurrentUser, loadAuthToken } from "./auth"
 import { listVaults, type VaultListItem } from "./api"
+import { unlockVaultV2 } from "./account-crypto"
 import {
   clearAllMasterKeys,
   clearMasterKey,
@@ -227,6 +228,106 @@ export function registerSyncIpcHandlers(): void {
         saltHex,
         connectedAt: new Date().toISOString(),
       })
+
+      return { ok: true, status: eng.getStatus() }
+    },
+  )
+
+  // ─── High-level connect v2 (key wrapping, password compte) ───────────
+  // Pour les vaults crypto_version=2. À la différence de sync:connect, on
+  // n'utilise PAS de "vault password" séparé — l'user saisit son password
+  // compte qui sert à déchiffrer sa privateKey Curve25519, laquelle déchiffre
+  // l'encrypted_master_key (sealed box) renvoyé par /api/vaults/:id/membership.
+  //
+  // La masterKey unwrappée est ensuite passée à engine.activate via le mode
+  // precomputedMasterKey (skip scrypt, juste HKDF — ~1-5ms). Elle est aussi
+  // persistée dans le keychain OS pour la réactivation auto au démarrage
+  // suivant (comportement identique à v1.0 à partir de ce point).
+  //
+  // Source de vérité : BRIEF_KEY_WRAPPING.md §"Connexion d'un workspace au vault".
+  ipcMain.handle(
+    "sync:connect-v2",
+    async (
+      _e,
+      args: {
+        workspaceRoot: string
+        vaultId: string
+        vaultName: string
+        accountPassword: string
+      },
+    ): Promise<ConnectResult> => {
+      const { workspaceRoot, vaultId, vaultName, accountPassword } = args
+      log.info("[sync/ipc] sync:connect-v2", { workspaceRoot, vaultId })
+
+      const token = loadAuthToken()
+      if (!token) {
+        return {
+          ok: false,
+          error: "Not signed in. Please sign in first.",
+          status: { state: "idle" },
+        }
+      }
+
+      // 1. Unlock pipeline v2 : password compte → privateKey → masterKey
+      let unlocked: Awaited<ReturnType<typeof unlockVaultV2>>
+      try {
+        unlocked = await unlockVaultV2(vaultId, accountPassword)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        log.warn("[sync/ipc] sync:connect-v2 unlock failed", { message })
+        return {
+          ok: false,
+          error: message,
+          status: { state: "idle" },
+        }
+      }
+
+      // 2. Active l'engine avec la masterKey précalculée (skip scrypt)
+      const eng = getEngine()
+      if (eng.getStatus().state !== "idle") {
+        log.info("[sync/ipc] sync:connect-v2 resetting engine before activate", {
+          previousState: eng.getStatus().state,
+        })
+        await eng.deactivate()
+      }
+      try {
+        await eng.activate({
+          workspaceRoot,
+          vaultId,
+          syncToken: token,
+          wsUrl: defaultWsUrl(),
+          precomputedMasterKey: unlocked.masterKey,
+          saltHex: unlocked.saltHex,
+        })
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        log.warn("[sync/ipc] sync:connect-v2 activate failed", { message })
+        unlocked.masterKey.fill(0)
+        return { ok: false, error: message, status: eng.getStatus() }
+      }
+
+      // 3. Persiste la master_key dans le keychain OS pour la réactivation
+      //    automatique au prochain démarrage (sync:reactivate fonctionne
+      //    identique en v1 et v2 — il prend juste une masterKey précalculée).
+      try {
+        const keys = getActiveKeys(vaultId)
+        storeMasterKey(vaultId, keys.masterKey)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        log.warn("[sync/ipc] storeMasterKey failed (non-fatal)", { message })
+      }
+
+      // 4. Enregistre dans le registry (saltHex permet la réactivation auto)
+      addOrUpdateWorkspace({
+        workspaceRoot,
+        vaultId,
+        vaultName,
+        saltHex: unlocked.saltHex,
+        connectedAt: new Date().toISOString(),
+      })
+
+      // SECURITY : zeroïse la masterKey locale (l'engine a sa propre copie)
+      unlocked.masterKey.fill(0)
 
       return { ok: true, status: eng.getStatus() }
     },
