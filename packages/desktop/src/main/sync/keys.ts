@@ -1,20 +1,18 @@
 /**
  * Gestion des clés crypto en RAM.
  *
- * Source de vérité : docs/CRYPTO_SPEC-v2.md §2 + BRIEF_BLOC_1_CLIENT_SYNC.md §0
+ * Source de vérité : docs/CRYPTO_SPEC-v2.md §2 + BRIEF_KEY_WRAPPING.md.
  *
- * INVARIANT DE SÉCURITÉ (cf brief §0) :
- *   Le vault_password et les clés dérivées (master_key, key_content,
- *   key_path_mac, key_path_enc) vivent UNIQUEMENT dans le process main
- *   d'Electron, en RAM, JAMAIS persistés en clair, JAMAIS transmis sur le
- *   réseau. Seul le `keyhash` (preuve de possession) part au serveur.
+ * INVARIANT DE SÉCURITÉ :
+ *   La masterKey et les clés dérivées (key_content, key_path_mac,
+ *   key_path_enc) vivent UNIQUEMENT dans le process main d'Electron, en
+ *   RAM, JAMAIS persistées en clair, JAMAIS transmises sur le réseau.
+ *   Seul le `keyhash` (preuve de possession) part au serveur.
  *
- *   Si une clé ou le password touche le disque ou le réseau, c'est un bug
- *   de sécurité.
+ *   Si une clé touche le disque ou le réseau, c'est un bug de sécurité.
  */
 
 import {
-  deriveVaultKeys,
   deriveVaultKeysFromMasterKey,
   type VaultKeys,
 } from "@prisme/sync-crypto"
@@ -23,56 +21,23 @@ import log from "electron-log"
 /**
  * Container des clés actives par vault_id.
  *
- * Une seule entrée à la fois en v1 (un workspace synchronisé). À étendre en
+ * Une seule entrée à la fois (un workspace synchronisé). À étendre en
  * Map<vaultId, VaultKeys> quand on supportera N workspaces sync en parallèle.
  */
 let activeKeys: { vaultId: string; keys: VaultKeys } | undefined
 
 /**
- * Dérive les clés d'un vault à partir du password + salt.
+ * (Ré)active les clés à partir d'une masterKey précalculée.
  *
- * Coûte ~50-150ms (scrypt N=32768). À appeler UNE FOIS à l'activation de la
- * sync sur un workspace. Le `vaultPassword` est immédiatement OUBLIÉ après
- * l'appel (le caller doit s'assurer qu'il ne le garde pas en référence).
+ * En v2.0 la masterKey est obtenue soit en unwrappant la sealed box du vault
+ * avec le keypair user (account-crypto.unlockVaultV2), soit relue depuis le
+ * keychain OS (sync:reactivate). L'engine ne dérive plus jamais en interne
+ * depuis un password — c'est juste HKDF des sous-clés ici.
  *
- * NE JAMAIS LOGGER : password, salt, ni AUCUN champ de VaultKeys (sauf
- * éventuellement keyhash qui est transmissible — mais par défaut on log
- * juste sa présence, pas sa valeur).
+ * NE JAMAIS LOGGER : masterKey, keyContent, keyPathMac, keyPathEnc.
  *
- * @param vaultPassword Mot de passe E2EE du vault (sera oublié immédiatement).
- * @param saltBuffer Salt 32B (récupéré depuis le serveur via /api/vaults).
- * @param vaultId UUID du vault pour stocker les clés actives.
- */
-export function activateKeys(
-  vaultPassword: string,
-  saltBuffer: Buffer,
-  vaultId: string,
-): { keyhash: Buffer; masterKey: Buffer } {
-  // SECURITY: pas de log de vaultPassword ni de saltBuffer ici.
-  const keys = deriveVaultKeys(vaultPassword, saltBuffer)
-  activeKeys = { vaultId, keys }
-  log.info("[sync/keys] activated", {
-    vaultId,
-    // On log SEULEMENT le préfixe du keyhash pour debug (8 chars hex = 4 bytes,
-    // pas de risque crypto). On ne log pas masterKey/keyContent/keyPathMac/keyPathEnc.
-    keyhashPrefix: keys.keyhash.subarray(0, 4).toString("hex"),
-  })
-  // On retourne masterKey en plus pour permettre au caller de la persister
-  // dans le keychain OS (cf key-storage.ts). C'est OK car la masterKey ne
-  // quitte pas le process main → on assume que le caller est responsable.
-  return { keyhash: keys.keyhash, masterKey: keys.masterKey }
-}
-
-/**
- * Variante : (ré)active les clés à partir d'une masterKey précalculée.
- *
- * Permet d'éviter le scrypt coûteux quand la masterKey a déjà été dérivée
- * dans une session précédente et stockée dans le keychain OS.
- *
- * SECURITY identique à activateKeys — pas de log de masterKey/sub-keys.
- *
- * @param masterKey 32 bytes lus depuis le keychain via key-storage.loadMasterKey.
- * @param saltBuffer 32 bytes (récupérés depuis le serveur via /api/vaults).
+ * @param masterKey 32 bytes.
+ * @param saltBuffer 32 bytes.
  * @param vaultId UUID du vault.
  */
 export function activateKeysFromMasterKey(

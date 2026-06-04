@@ -2,24 +2,14 @@
  * SyncEngine — orchestrateur du client de synchronisation.
  *
  * Source de vérité : docs/SYNC_ARCHITECTURE_SPEC.md §4 (côté client) +
- * BRIEF_BLOC_1_CLIENT_SYNC.md.
+ * BRIEF_BLOC_1_CLIENT_SYNC.md + BRIEF_KEY_WRAPPING.md (v2.0).
  *
- * Session A scope (étapes 22-29) :
- *   activate() :
- *     1. activateKeys(password, salt) → masterKey/keyContent/keyPathMac/keyPathEnc en RAM
- *     2. openStateDb(workspaceRoot) → SQLite .prisme-sync/state.db
- *     3. setMeta { vault_id, device_id, salt, keyhash } si pas déjà initialisé
- *     4. createWsClient(wsUrl, syncToken).connect()
- *     5. on open → sendJson({op:'init', vault_id, keyhash, vault_version,
- *                            initial, device, crypto_version})
- *     6. attendre {op:'ready', vault_version, per_file_max, per_push_max}
- *     7. status = 'ready'
+ * activate() prend une `precomputedMasterKey` (32B) — le caller (sync:connect
+ * IPC handler) la fournit après avoir unwrappé la masterKey du vault via le
+ * keypair user (cf account-crypto.ts). L'engine fait juste HKDF des sous-clés.
  *
- *   Pas de push/pull en Session A — le watcher (étape 27) ne fait que loguer
- *   les events fs pour valider la stack.
- *
- * SECURITY : `vaultPassword` ne doit JAMAIS être logué, ni stocké en attribut
- * de la classe au-delà du dérivage des clés. Il est consommé puis perdu.
+ * SECURITY : `precomputedMasterKey` ne doit JAMAIS être logué ni stocké en
+ * attribut de la classe au-delà du dérivage des sous-clés.
  */
 
 import { randomBytes } from "node:crypto"
@@ -30,7 +20,6 @@ import type {
 } from "@prisme/sync-crypto/contracts"
 import { CRYPTO_VERSION, PERIODIC_SWEEP_INTERVAL_MS } from "./constants"
 import {
-  activateKeys,
   activateKeysFromMasterKey,
   deactivateKeys,
   getActiveKeys,
@@ -59,7 +48,6 @@ import { dirname, join, normalize, sep } from "node:path"
 import { decryptPath } from "@prisme/sync-crypto"
 import { openStateDb, type SyncStateDb } from "./state/db"
 import { hashFile, runInitialSweep, type SweepResult } from "./sweep"
-import { createRestClient } from "./transport/rest-client"
 import { createWsClient, type WsClient } from "./transport/ws-client"
 import { startFileWatcher, type FileWatcher, type FsEvent } from "./watcher"
 
@@ -68,33 +56,20 @@ export interface SyncConfig {
   workspaceRoot: string
   /** UUID du vault côté serveur (récupéré via /api/vaults). */
   vaultId: string
-  /**
-   * Base URL du site SaaS ③ (ex: https://workspace.prisme.one ou
-   * http://localhost:3020). Si fourni, l'engine fetch le ws_url via
-   * `POST /api/vaults/:id/access`. Sinon, `wsUrl` doit être fourni.
-   */
-  siteUrl?: string
-  /** URL du serveur sync (ex: ws://localhost:3010/sync). Optionnel si siteUrl
-   *  est fourni — sera résolu via /api/vaults/:id/access. */
-  wsUrl?: string
+  /** URL du serveur sync (ex: ws://localhost:3010/sync). */
+  wsUrl: string
   /** Bearer JWT obtenu via /api/auth/sync-token côté site SaaS. */
   syncToken: string
   /**
-   * Mot de passe E2EE du vault — utilisé une fois pour dériver les clés,
-   * puis OUBLIÉ. Ne JAMAIS persister, ne JAMAIS logger.
+   * masterKey 32B précalculée — obtenue soit en unwrappant la sealed box du
+   * vault avec le keypair user (sync:connect → account-crypto.unlockVaultV2),
+   * soit relue depuis le keychain OS (sync:reactivate). L'engine ne dérive
+   * plus jamais en interne depuis un password ; il fait juste HKDF des
+   * sous-clés (cf keys.ts:activateKeysFromMasterKey).
    *
-   * Soit `vaultPassword`, soit `precomputedMasterKey` doit être fourni :
-   *  - vaultPassword → dérivation complète via scrypt (~50-150ms)
-   *  - precomputedMasterKey → skip scrypt, refait juste HKDF (~1-5ms).
-   *    Utilisé pour la réactivation automatique avec masterKey lue depuis
-   *    le keychain OS (cf KEYCHAIN_OS.md).
+   * SECURITY : ne JAMAIS persister en clair, ne JAMAIS logger.
    */
-  vaultPassword?: string
-  /**
-   * Alternative à vaultPassword : 32 bytes masterKey précédemment dérivés
-   * via scrypt et stockés dans le keychain. Skip la dérivation coûteuse.
-   */
-  precomputedMasterKey?: Buffer
+  precomputedMasterKey: Buffer
   /** salt hex (32B) issu de la création du vault côté site SaaS. */
   saltHex: string
 }
@@ -181,37 +156,28 @@ export class SyncEngine {
     log.info("[sync] activate requested", {
       workspaceRoot: config.workspaceRoot,
       vaultId: config.vaultId,
-      wsUrl: config.wsUrl ?? "(via siteUrl)",
-      siteUrl: config.siteUrl,
-      mode: config.precomputedMasterKey ? "from_master_key" : "from_password",
-      // SECURITY: pas de log de vaultPassword, syncToken, saltHex, masterKey.
+      wsUrl: config.wsUrl,
+      // SECURITY: pas de log de syncToken, saltHex, masterKey.
     })
     this.status = { state: "activating" }
 
-    // 1. Dérivation clés crypto. SECURITY : ni le password ni la masterKey
-    //    ne sont réutilisés après activateKeys / activateKeysFromMasterKey.
+    // 1. Dérivation des sous-clés depuis la masterKey précalculée (HKDF).
+    //    SECURITY : la masterKey ne sort jamais d'ici, et n'est pas stockée
+    //    en attribut de la classe.
     const saltBuffer = Buffer.from(config.saltHex, "hex")
     if (saltBuffer.length !== 32) {
       this.status = { state: "error", message: `Invalid salt length: ${saltBuffer.length} (expected 32)` }
       throw new Error(this.status.message)
     }
-    let keyhash: Buffer
-    if (config.precomputedMasterKey) {
-      // Réactivation rapide via masterKey persistée — skip scrypt (~1-5ms)
-      if (config.precomputedMasterKey.length !== 32) {
-        this.status = { state: "error", message: `Invalid masterKey length: ${config.precomputedMasterKey.length} (expected 32)` }
-        throw new Error(this.status.message)
-      }
-      const res = activateKeysFromMasterKey(config.precomputedMasterKey, saltBuffer, config.vaultId)
-      keyhash = res.keyhash
-    } else if (config.vaultPassword) {
-      // Activation initiale via scrypt (~50-150ms)
-      const res = activateKeys(config.vaultPassword, saltBuffer, config.vaultId)
-      keyhash = res.keyhash
-    } else {
-      this.status = { state: "error", message: "Either vaultPassword or precomputedMasterKey must be provided" }
+    if (config.precomputedMasterKey.length !== 32) {
+      this.status = { state: "error", message: `Invalid masterKey length: ${config.precomputedMasterKey.length} (expected 32)` }
       throw new Error(this.status.message)
     }
+    const { keyhash } = activateKeysFromMasterKey(
+      config.precomputedMasterKey,
+      saltBuffer,
+      config.vaultId,
+    )
     const keyhashHex = keyhash.toString("hex")
 
     // 2. Ouvre / crée la DB locale.
@@ -231,32 +197,13 @@ export class SyncEngine {
     this.vaultId = config.vaultId
     this.workspaceRoot = config.workspaceRoot
 
-    // 4. Résolution ws_url : soit fourni dans SyncConfig, soit fetché via
-    //    POST /api/vaults/:id/access côté site SaaS ③ (Étape 36).
-    let wsUrl = config.wsUrl
-    let serverVaultVersion = lastKnownVersion
-    if (!wsUrl) {
-      if (!config.siteUrl) {
-        this.status = {
-          state: "error",
-          message: "SyncConfig must provide either wsUrl or siteUrl",
-        }
-        throw new Error(this.status.message)
-      }
-      const rest = createRestClient({ baseUrl: config.siteUrl, syncToken: config.syncToken })
-      const access = await rest.getVaultAccess(config.vaultId, keyhashHex)
-      wsUrl = access.ws_url
-      serverVaultVersion = access.vault_version
-      log.info("[sync] access OK", { ws_url: wsUrl, vault_version: serverVaultVersion })
-    }
-
-    // 5. Connexion WS + handshake init.
+    // 4. Connexion WS + handshake init.
     await this.connectAndHandshake({
-      wsUrl,
+      wsUrl: config.wsUrl,
       syncToken: config.syncToken,
       vaultId: config.vaultId,
       keyhashHex,
-      vaultVersion: serverVaultVersion,
+      vaultVersion: lastKnownVersion,
       initial,
       deviceId,
     })
@@ -594,7 +541,7 @@ export class SyncEngine {
    *
    * - add / change : hash, skip si identique au cache, enqueue push + drain
    * - unlink : enqueue delete + drain
-   * - addDir / unlinkDir : ignorés en v1 (folders pas push individuels)
+   * - addDir / unlinkDir : ignorés (folders pas push individuels)
    *
    * Erreurs silencieuses (warn) : si le fichier disparaît entre l'event et
    * le hash, le pipeline traitera ça comme un delete au moment du drain.

@@ -152,7 +152,7 @@ async function finalizeInbound(s: PullState, opts: PullPipelineOptions): Promise
     // Cela signifie que l'utilisateur a édité localement sans avoir
     // encore push. Sans gestion, atomicWrite écraserait son travail.
     //
-    // Stratégie v1 : conflict copy (sauf si le local matche déjà le remote
+    // Stratégie : conflict copy (sauf si le local matche déjà le remote
     // = pas de vraie divergence). Le local est sauvegardé sous
     // `<path>.conflict-<device>-<ISO>.<ext>` avant écrasement.
     const remoteHash = sha256Hex(plaintext)

@@ -2,7 +2,7 @@
  * Handlers IPC du module sync.
  *
  * Source de vérité : docs/SYNC_ARCHITECTURE_SPEC.md §4 + BRIEF_BLOC_1 §4.5
- *                  + DESKTOP_UI_SYNC_INTEGRATION.md (sync UI v1).
+ *                  + BRIEF_KEY_WRAPPING.md (v2.0).
  *
  * Surface IPC complète :
  *
@@ -23,24 +23,20 @@
  *
  *   Sync engine
  *   -----------
- *   - sync:connect(workspaceRoot, vaultId, saltHex, vaultPassword, vaultName)
- *       → active l'engine (dérive master_key en interne, vérifie keyhash via
- *         handshake serveur) + ajoute au registry
+ *   - sync:connect(workspaceRoot, vaultId, vaultName, accountPassword)
+ *       → déchiffre la privateKey user, unwrap la masterKey du vault, active
+ *         l'engine, persiste la masterKey dans le keychain, ajoute au registry
+ *   - sync:reactivate(workspaceRoot)
+ *       → réactivation auto au démarrage via masterKey persistée dans le keychain
  *   - sync:activate(config)      → low-level direct (compat smoke tests)
  *   - sync:deactivate()          → libère le WS + ferme la DB
  *   - sync:disconnect(workspaceRoot)
  *       → désactive + retire du registry + efface la master_key persistée
  *   - sync:status()              → SyncStatus
  *
- * NOTE v1 : pas de réactivation automatique au démarrage. L'utilisateur
- * ressaisit le password à chaque ouverture de l'app pour les workspaces déjà
- * connectés (cf DESKTOP_UI_SYNC_INTEGRATION.md Q3). v1.1+ pourra étendre
- * engine.activate pour accepter une masterKey précalculée et lire depuis le
- * keychain.
- *
  * SECURITY : on logue les retours non-sensibles mais JAMAIS le SyncConfig
- * complet (contient password + token), ni le password, ni la master_key, ni
- * le JWT.
+ * complet (contient masterKey + token), ni le password compte, ni la
+ * master_key, ni le JWT.
  */
 
 import { ipcMain, type IpcMainInvokeEvent } from "electron"
@@ -157,7 +153,17 @@ export function registerSyncIpcHandlers(): void {
       getWorkspaceEntry(workspaceRoot),
   )
 
-  // ─── High-level connect (dérive master_key + persiste + active) ──────
+  // ─── High-level connect (key wrapping v2.0, password compte) ─────────
+  //
+  // L'user saisit son password compte qui sert à déchiffrer sa privateKey
+  // Curve25519, laquelle déchiffre l'encrypted_master_key (sealed box) renvoyé
+  // par /api/vaults/:id/membership.
+  //
+  // La masterKey unwrappée est passée à engine.activate (precomputedMasterKey
+  // → HKDF des sous-clés, ~1-5ms). Elle est aussi persistée dans le keychain
+  // OS pour la réactivation auto au démarrage suivant.
+  //
+  // Source de vérité : BRIEF_KEY_WRAPPING.md §"Connexion d'un workspace au vault".
   ipcMain.handle(
     "sync:connect",
     async (
@@ -166,11 +172,10 @@ export function registerSyncIpcHandlers(): void {
         workspaceRoot: string
         vaultId: string
         vaultName: string
-        saltHex: string
-        vaultPassword: string
+        accountPassword: string
       },
     ): Promise<ConnectResult> => {
-      const { workspaceRoot, vaultId, vaultName, saltHex, vaultPassword } = args
+      const { workspaceRoot, vaultId, vaultName, accountPassword } = args
       log.info("[sync/ipc] sync:connect", { workspaceRoot, vaultId })
 
       const token = loadAuthToken()
@@ -182,8 +187,21 @@ export function registerSyncIpcHandlers(): void {
         }
       }
 
-      // Active l'engine — dérive master_key via scrypt en interne et vérifie
-      // le keyhash contre le serveur au handshake init.
+      // 1. Unlock : password compte → privateKey → masterKey
+      let unlocked: Awaited<ReturnType<typeof unlockVaultV2>>
+      try {
+        unlocked = await unlockVaultV2(vaultId, accountPassword)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        log.warn("[sync/ipc] sync:connect unlock failed", { message })
+        return {
+          ok: false,
+          error: message,
+          status: { state: "idle" },
+        }
+      }
+
+      // 2. Active l'engine avec la masterKey précalculée (HKDF des sous-clés)
       const eng = getEngine()
       // Reset si l'engine est resté dans un état non-idle suite à un précédent
       // échec (ex: handshake 4001 keyhash mismatch). activate() exige `idle`.
@@ -199,116 +217,18 @@ export function registerSyncIpcHandlers(): void {
           vaultId,
           syncToken: token,
           wsUrl: defaultWsUrl(),
-          vaultPassword,
-          saltHex,
-        })
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
-        log.warn("[sync/ipc] sync:connect activate failed", { message })
-        return { ok: false, error: message, status: eng.getStatus() }
-      }
-
-      // Persiste la master_key dans le keychain OS pour permettre la
-      // réactivation automatique au prochain démarrage (sync:reactivate).
-      // Non-fatal si safeStorage indispo : l'utilisateur ressaisira le
-      // password.
-      try {
-        const keys = getActiveKeys(vaultId)
-        storeMasterKey(vaultId, keys.masterKey)
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
-        log.warn("[sync/ipc] storeMasterKey failed (non-fatal)", { message })
-      }
-
-      // Enregistre dans le registry pour l'UI Settings → Sync.
-      addOrUpdateWorkspace({
-        workspaceRoot,
-        vaultId,
-        vaultName,
-        saltHex,
-        connectedAt: new Date().toISOString(),
-      })
-
-      return { ok: true, status: eng.getStatus() }
-    },
-  )
-
-  // ─── High-level connect v2 (key wrapping, password compte) ───────────
-  // Pour les vaults crypto_version=2. À la différence de sync:connect, on
-  // n'utilise PAS de "vault password" séparé — l'user saisit son password
-  // compte qui sert à déchiffrer sa privateKey Curve25519, laquelle déchiffre
-  // l'encrypted_master_key (sealed box) renvoyé par /api/vaults/:id/membership.
-  //
-  // La masterKey unwrappée est ensuite passée à engine.activate via le mode
-  // precomputedMasterKey (skip scrypt, juste HKDF — ~1-5ms). Elle est aussi
-  // persistée dans le keychain OS pour la réactivation auto au démarrage
-  // suivant (comportement identique à v1.0 à partir de ce point).
-  //
-  // Source de vérité : BRIEF_KEY_WRAPPING.md §"Connexion d'un workspace au vault".
-  ipcMain.handle(
-    "sync:connect-v2",
-    async (
-      _e,
-      args: {
-        workspaceRoot: string
-        vaultId: string
-        vaultName: string
-        accountPassword: string
-      },
-    ): Promise<ConnectResult> => {
-      const { workspaceRoot, vaultId, vaultName, accountPassword } = args
-      log.info("[sync/ipc] sync:connect-v2", { workspaceRoot, vaultId })
-
-      const token = loadAuthToken()
-      if (!token) {
-        return {
-          ok: false,
-          error: "Not signed in. Please sign in first.",
-          status: { state: "idle" },
-        }
-      }
-
-      // 1. Unlock pipeline v2 : password compte → privateKey → masterKey
-      let unlocked: Awaited<ReturnType<typeof unlockVaultV2>>
-      try {
-        unlocked = await unlockVaultV2(vaultId, accountPassword)
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
-        log.warn("[sync/ipc] sync:connect-v2 unlock failed", { message })
-        return {
-          ok: false,
-          error: message,
-          status: { state: "idle" },
-        }
-      }
-
-      // 2. Active l'engine avec la masterKey précalculée (skip scrypt)
-      const eng = getEngine()
-      if (eng.getStatus().state !== "idle") {
-        log.info("[sync/ipc] sync:connect-v2 resetting engine before activate", {
-          previousState: eng.getStatus().state,
-        })
-        await eng.deactivate()
-      }
-      try {
-        await eng.activate({
-          workspaceRoot,
-          vaultId,
-          syncToken: token,
-          wsUrl: defaultWsUrl(),
           precomputedMasterKey: unlocked.masterKey,
           saltHex: unlocked.saltHex,
         })
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
-        log.warn("[sync/ipc] sync:connect-v2 activate failed", { message })
+        log.warn("[sync/ipc] sync:connect activate failed", { message })
         unlocked.masterKey.fill(0)
         return { ok: false, error: message, status: eng.getStatus() }
       }
 
       // 3. Persiste la master_key dans le keychain OS pour la réactivation
-      //    automatique au prochain démarrage (sync:reactivate fonctionne
-      //    identique en v1 et v2 — il prend juste une masterKey précalculée).
+      //    automatique au prochain démarrage (sync:reactivate).
       try {
         const keys = getActiveKeys(vaultId)
         storeMasterKey(vaultId, keys.masterKey)

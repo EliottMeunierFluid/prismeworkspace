@@ -7,7 +7,8 @@
  *
  * Endpoints utilisés :
  *   GET /api/vaults                  → liste des vaults du user
- *   POST /api/vaults/:id/access      → vérif keyhash + ws_url (pour engine)
+ *   GET /api/vaults/:id/membership   → sealed box + méta vault (key wrapping v2)
+ *   GET /api/auth/me                 → profil + méta crypto user
  */
 
 import log from "electron-log"
@@ -89,30 +90,6 @@ export async function listVaults(): Promise<VaultListItem[]> {
   const res = await authFetch("/api/vaults")
   const body = (await res.json()) as { vaults?: VaultListItem[] }
   return body.vaults ?? []
-}
-
-/**
- * Vérifie l'accès à un vault donné (envoie keyhash, reçoit ws_url + vault_version).
- *
- * NOTE : non utilisé dans la v1 — l'engine reçoit le ws_url directement via
- * la config IPC. À garder pour quand on passera ce flow par le site SaaS.
- */
-export interface VaultAccessResponse {
-  allowed: boolean
-  ws_url: string
-  vault_version: number
-}
-
-export async function getVaultAccess(
-  vaultId: string,
-  keyhashHex: string,
-): Promise<VaultAccessResponse> {
-  log.info("[sync/api] POST /api/vaults/:id/access", { vaultId })
-  const res = await authFetch(`/api/vaults/${vaultId}/access`, {
-    method: "POST",
-    body: JSON.stringify({ keyhash: keyhashHex }),
-  })
-  return (await res.json()) as VaultAccessResponse
 }
 
 /**

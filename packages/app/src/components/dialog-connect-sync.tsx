@@ -1,12 +1,13 @@
 /**
  * Wizard 3 étapes pour connecter un workspace à un vault sync E2EE.
  *
- * Source de vérité : DESKTOP_UI_SYNC_INTEGRATION.md (sandbox sync).
+ * Source de vérité : BRIEF_KEY_WRAPPING.md (sandbox sync).
  *
  * Steps :
  *  1. signIn       — flow OAuth navigateur si pas loggé
  *  2. chooseVault  — liste les vaults du user + bouton "Create new vault"
- *  3. unlock       — saisie du vault_password + dérivation crypto serveur
+ *  3. unlock       — saisie du password compte qui déchiffre la privateKey
+ *                    user, laquelle unwrap la masterKey du vault
  *
  * Composant autonome — ouvert depuis usePrismeSync().openConnectDialog(target).
  * Réutilisable depuis l'indicateur header (option C), Settings tab (option B),
@@ -27,9 +28,6 @@ type Vault = {
   owner_type: "personal" | "team" | "company"
   size_bytes: number
   quota_bytes: number
-  salt: string
-  /** 1 = legacy password vault (v1.0), 2 = key wrapping (v2.0). */
-  crypto_version: number
 }
 
 type Step = "signIn" | "chooseVault" | "unlock" | "connecting" | "done" | "error"
@@ -71,9 +69,9 @@ export function DialogConnectSync(props: { target: ConnectDialogTarget }) {
    * "unlock" (cas typique : auto-reactivate a échoué car masterKey absente
    * du keychain, l'user clique l'indicateur orange pour ressaisir le password).
    */
-  const existingEntry = (): { vaultId: string; vaultName: string; saltHex: string } | undefined => {
+  const existingEntry = (): { vaultId: string; vaultName: string } | undefined => {
     const e = sync.getWorkspaceEntry(props.target.workspaceRoot)
-    return e ? { vaultId: e.vaultId, vaultName: e.vaultName, saltHex: e.saltHex } : undefined
+    return e ? { vaultId: e.vaultId, vaultName: e.vaultName } : undefined
   }
 
   const initialStep = (): Step => {
@@ -100,14 +98,12 @@ export function DialogConnectSync(props: { target: ConnectDialogTarget }) {
     }
   })
 
-  // Charge les vaults dès qu'on entre dans chooseVault
-  // ET aussi quand on est en unlock direct (pour récupérer le nom + salt du vault)
+  // Charge les vaults dès qu'on entre dans chooseVault.
+  // En unlock direct (workspace déjà dans le registry), on n'a pas besoin de
+  // les charger — le vaultId + vaultName du registry suffisent (la masterKey
+  // est unwrappée côté main via /api/vaults/:id/membership).
   createEffect(() => {
-    if (
-      (step() === "chooseVault" || step() === "unlock") &&
-      !vaultsFetched() &&
-      !loadingVaults()
-    ) {
+    if (step() === "chooseVault" && !vaultsFetched() && !loadingVaults()) {
       void loadVaults()
     }
   })
@@ -172,43 +168,19 @@ export function DialogConnectSync(props: { target: ConnectDialogTarget }) {
     const api = getApi()
     if (!api?.syncConnect) return
 
-    // Récupère les méta du vault : soit depuis le registry local (cas
-    // re-unlock d'un workspace déjà connecté), soit depuis la liste API
-    // (cas connexion initiale).
     const fromRegistry = sync.getWorkspaceEntry(props.target.workspaceRoot)
     const fromList = vaults().find((v) => v.id === vaultId)
-    const saltHex = fromList?.salt ?? fromRegistry?.saltHex
     const vaultName = fromList?.name ?? fromRegistry?.vaultName ?? ""
-    const cryptoVersion = fromList?.crypto_version ?? 1
-
-    if (!saltHex && cryptoVersion === 1) {
-      setError(language.t("dialog.connectSync.error.saltMissing"))
-      setStep("error")
-      return
-    }
 
     setStep("connecting")
     setError(null)
     try {
-      // Branchement v1.0 vs v2.0 selon le crypto_version du vault.
-      //  - v1.0 : on saisit le mot de passe DU VAULT (legacy)
-      //  - v2.0 : on saisit le mot de passe DU COMPTE — déchiffre la
-      //           privateKey user qui unwrap la masterKey du vault
-      const res =
-        cryptoVersion === 2
-          ? await (api.syncConnectV2 ?? unsupportedV2)({
-              workspaceRoot: props.target.workspaceRoot,
-              vaultId,
-              vaultName,
-              accountPassword: password(),
-            })
-          : await api.syncConnect({
-              workspaceRoot: props.target.workspaceRoot,
-              vaultId,
-              vaultName,
-              saltHex: saltHex!,
-              vaultPassword: password(),
-            })
+      const res = await api.syncConnect({
+        workspaceRoot: props.target.workspaceRoot,
+        vaultId,
+        vaultName,
+        accountPassword: password(),
+      })
 
       if (!res.ok) {
         setError(res.error ?? language.t("dialog.connectSync.error.connect"))
@@ -227,28 +199,11 @@ export function DialogConnectSync(props: { target: ConnectDialogTarget }) {
     }
   }
 
-  /** Fallback si une build desktop trop ancienne expose pas syncConnectV2. */
-  async function unsupportedV2(): Promise<{ ok: false; error: string; status: { state: "idle" } }> {
-    return {
-      ok: false,
-      error: "Cette build desktop ne supporte pas les vaults v2. Mettez à jour l'application.",
-      status: { state: "idle" },
-    }
-  }
-
   const workspaceLabel = (): string =>
     props.target.workspaceName ?? basename(props.target.workspaceRoot)
 
   const selectedVaultName = (): string =>
     vaults().find((v) => v.id === selectedVaultId())?.name ?? existingEntry()?.vaultName ?? ""
-
-  /**
-   * crypto_version du vault sélectionné. 1 = legacy password vault, 2 = key
-   * wrapping (l'user saisira son password compte au lieu d'un password vault).
-   * Défaut 1 si on n'a pas l'info (cas paranoïaque, ne devrait pas arriver).
-   */
-  const selectedVaultCryptoVersion = (): number =>
-    vaults().find((v) => v.id === selectedVaultId())?.crypto_version ?? 1
 
   const headerTitle = (): string => {
     switch (step()) {
@@ -257,9 +212,7 @@ export function DialogConnectSync(props: { target: ConnectDialogTarget }) {
       case "chooseVault":
         return language.t("dialog.connectSync.step2.title")
       case "unlock":
-        return selectedVaultCryptoVersion() === 2
-          ? language.t("dialog.connectSync.step3.title_v2", { vault: selectedVaultName() })
-          : language.t("dialog.connectSync.step3.title", { vault: selectedVaultName() })
+        return language.t("dialog.connectSync.step3.title", { vault: selectedVaultName() })
       case "connecting":
         return language.t("dialog.connectSync.connecting.title")
       case "done":
@@ -276,9 +229,7 @@ export function DialogConnectSync(props: { target: ConnectDialogTarget }) {
       case "chooseVault":
         return language.t("dialog.connectSync.step2.subtitle")
       case "unlock":
-        return selectedVaultCryptoVersion() === 2
-          ? language.t("dialog.connectSync.step3.subtitle_v2")
-          : language.t("dialog.connectSync.step3.subtitle")
+        return language.t("dialog.connectSync.step3.subtitle")
       case "connecting":
         return language.t("dialog.connectSync.connecting.subtitle")
       case "done":
@@ -386,24 +337,18 @@ export function DialogConnectSync(props: { target: ConnectDialogTarget }) {
             </div>
           </Match>
 
-          {/* ─── Step 3 : Unlock with password (v1 vault / v2 account) ─ */}
+          {/* ─── Step 3 : Unlock with account password (key wrapping v2.0) ─ */}
           <Match when={step() === "unlock"}>
             <form onSubmit={handleUnlockAndConnect} class="flex flex-col gap-3">
               <TextField
                 type="password"
-                placeholder={
-                  selectedVaultCryptoVersion() === 2
-                    ? language.t("dialog.connectSync.step3.passwordPlaceholder_v2")
-                    : language.t("dialog.connectSync.step3.passwordPlaceholder")
-                }
+                placeholder={language.t("dialog.connectSync.step3.passwordPlaceholder")}
                 value={password()}
                 onChange={(v) => setPassword(v)}
                 autofocus
               />
               <div class="text-12-regular text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
-                {selectedVaultCryptoVersion() === 2
-                  ? language.t("dialog.connectSync.step3.warning_v2")
-                  : language.t("dialog.connectSync.step3.warning")}
+                {language.t("dialog.connectSync.step3.warning")}
               </div>
               <div class="flex items-center justify-end gap-2 pt-1">
                 <Show when={!existingEntry()}>

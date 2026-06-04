@@ -85,15 +85,8 @@ const api: ElectronAPI = {
     workspaceRoot: string
     vaultId: string
     vaultName: string
-    saltHex: string
-    vaultPassword: string
-  }) => ipcRenderer.invoke("sync:connect", args),
-  syncConnectV2: (args: {
-    workspaceRoot: string
-    vaultId: string
-    vaultName: string
     accountPassword: string
-  }) => ipcRenderer.invoke("sync:connect-v2", args),
+  }) => ipcRenderer.invoke("sync:connect", args),
   syncReactivate: (workspaceRoot: string) =>
     ipcRenderer.invoke("sync:reactivate", workspaceRoot),
   syncHasStoredKey: (workspaceRoot: string) =>
