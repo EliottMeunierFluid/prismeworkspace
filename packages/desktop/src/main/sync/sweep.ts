@@ -108,7 +108,7 @@ async function scanWorkspace(workspaceRoot: string): Promise<ScannedEntry[]> {
         })
       }
       // Symlinks et autres : ignorés volontairement (cf brief §4.3 — pas
-      // de symlink dans la v1, source d'attaques path-traversal côté serveur).
+      // de symlink supporté, source d'attaques path-traversal côté serveur).
     }
   }
 
@@ -140,7 +140,7 @@ export async function runInitialSweep(
     if (entry.is_folder) {
       // Folders : on track dans local_files mais on ne push pas (Étape 31
       // décide si on les sync ou pas — Obsidian/Prisma n'envoient pas les
-      // folders en push individuels en v1).
+      // folders en push individuels).
       const cached = db.getLocalFile(entry.path)
       if (!cached || cached.is_folder !== true) {
         const data: LocalFileData = {
@@ -187,7 +187,7 @@ export async function runInitialSweep(
   for (const { path, data } of cachedFiles) {
     if (scannedByPath.has(path)) continue
     if (data.is_folder) {
-      // Folder disparu : on retire du cache mais pas de delete WS (idem v1).
+      // Folder disparu : on retire du cache mais pas de delete WS.
       db.deleteLocalFile(path)
       continue
     }

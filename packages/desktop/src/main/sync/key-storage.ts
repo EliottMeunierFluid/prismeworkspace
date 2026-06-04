@@ -1,22 +1,15 @@
 /**
  * Stockage chiffré OS de la master_key par vault.
  *
- * v1 : module présent mais NON utilisé activement — la masterKey est dérivée
- * en RAM à chaque sync:connect (cf KEYCHAIN_OS.md Q3 dans
- * DESKTOP_UI_SYNC_INTEGRATION.md). v1.1+ activera la persistance keychain
- * pour éviter la ressaisie du vault_password à chaque démarrage.
- *
- * On garde le module pour :
- *  - clearAllMasterKeys() appelé au sign out global pour nettoyer toute
- *    persistance résiduelle d'une éventuelle version antérieure
- *  - faciliter l'activation en v1.1 (juste appeler storeMasterKey dans
- *    sync:connect et ajouter un sync:reactivate)
+ * Utilisé par sync:connect (après unlock) pour permettre la réactivation
+ * automatique de la sync au prochain démarrage (sync:reactivate) sans avoir
+ * à ressaisir le password compte.
  *
  * Mécanisme : electron.safeStorage (macOS Keychain, Windows DPAPI, Linux
  * libsecret). Pas de native binding additionnel — c'est l'API officielle.
  *
  * SECURITY :
- *  - La master_key dérivée scrypt(vault_password, salt) est stockée chiffrée.
+ *  - La masterKey (32B) est stockée chiffrée par le keystore OS.
  *  - Une autre app sur le même OS ne peut PAS la lire (sauf si root/admin).
  *  - Quand l'utilisateur sign out du vault, on efface la clé via clearMasterKey.
  *  - Si safeStorage n'est pas dispo (rare — Linux sans libsecret), on ne
