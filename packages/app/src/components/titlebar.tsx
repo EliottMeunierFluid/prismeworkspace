@@ -14,6 +14,7 @@ import { useLanguage } from "@/context/language"
 import { useSettings } from "@/context/settings"
 import { applyPath, backPath, forwardPath } from "./titlebar-history"
 import { SyncIndicator } from "./sync-indicator"
+import { ConfigIndicator } from "./config-indicator"
 
 type TauriDesktopWindow = {
   startDragging?: () => Promise<void>
@@ -326,6 +327,7 @@ export function Titlebar() {
           onMouseDown={drag}
         >
           <div id="opencode-titlebar-right" class="flex items-center gap-1 shrink-0 justify-end" />
+          <ConfigIndicator />
           <SyncIndicator />
           <Show when={windows()}>
             {!tauriApi() && <div class="shrink-0" style={{ width: windowsControlsWidth() }} />}

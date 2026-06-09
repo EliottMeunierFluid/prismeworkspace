@@ -49,6 +49,7 @@ import { parseMarkdown } from "./markdown"
 import { createMenu } from "./menu"
 import { getDefaultServerUrl, getWslConfig, setDefaultServerUrl, setWslConfig, spawnLocalServer } from "./server"
 import { registerSyncIpcHandlers, shutdownSync } from "./sync"
+import { registerConfigIpcHandlers } from "./config"
 import {
   createLoadingWindow,
   createMainWindow,
@@ -318,6 +319,7 @@ registerIpcHandlers({
 })
 
 registerSyncIpcHandlers()
+registerConfigIpcHandlers()
 
 function killSidecar() {
   if (!server) return

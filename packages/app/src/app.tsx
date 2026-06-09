@@ -180,6 +180,44 @@ declare global {
         | { state: "error"; message: string }
       >
       openLink?: (url: string) => void
+      // ─── Config (récupération sans IA, cf packages/desktop/src/preload/types.ts) ──
+      configStatus?: (
+        projectDir?: string,
+      ) => Promise<{ configured: boolean; lastSync: string | null }>
+      configPull?: (projectDir: string) => Promise<{
+        filesDownloaded: number
+        byCategory: Record<string, number>
+        skillSymlinks: number
+        mcpServices: number
+        mcpEnabled: boolean
+        lastSync: string
+      }>
+      configPlan?: (projectDir: string) => Promise<{
+        diff: {
+          pull: { path: string; hash: string }[]
+          push: { path: string; hash: string }[]
+          conflicts: {
+            path: string
+            localHash: string
+            remoteHash: string
+            ancestorHash: string | null
+            writable: boolean
+          }[]
+          revoked: { path: string; hash: string }[]
+        }
+      }>
+      configApply?: (args: {
+        projectDir: string
+        resolutions?: Record<string, "local" | "remote">
+        deleteRevoked?: boolean
+      }) => Promise<{
+        pulled: number
+        pushed: number
+        revoked: number
+        conflictsResolved: number
+        rejected: { path: string; reason: string }[]
+        lastSync: string
+      }>
       // ─── Generic key-value persistent store via electron-store ────────
       storeGet?: (name: string, key: string) => Promise<string | null>
       storeSet?: (name: string, key: string, value: string) => Promise<void>

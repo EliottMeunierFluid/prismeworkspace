@@ -183,4 +183,56 @@ export type ElectronAPI = {
     | { state: "disconnected"; reason: string }
     | { state: "error"; message: string }
   >
+
+  // ─── Config (récupération sans IA) ───────────────────────────────────
+  configStatus: (projectDir?: string) => Promise<{ configured: boolean; lastSync: string | null }>
+  configPull: (projectDir: string) => Promise<ConfigPullReport>
+  configPlan: (projectDir: string) => Promise<ConfigSyncPlan>
+  configApply: (args: {
+    projectDir: string
+    resolutions?: Record<string, "local" | "remote">
+    deleteRevoked?: boolean
+  }) => Promise<ConfigSyncReport>
+}
+
+export interface ConfigPullReport {
+  filesDownloaded: number
+  byCategory: Record<string, number>
+  skillSymlinks: number
+  mcpServices: number
+  mcpEnabled: boolean
+  lastSync: string
+}
+
+export interface ConfigDiffEntry {
+  path: string
+  hash: string
+  scope?: string
+  permission?: "read" | "write"
+}
+
+export interface ConfigConflictEntry {
+  path: string
+  localHash: string
+  remoteHash: string
+  ancestorHash: string | null
+  writable: boolean
+}
+
+export interface ConfigSyncPlan {
+  diff: {
+    pull: ConfigDiffEntry[]
+    push: ConfigDiffEntry[]
+    conflicts: ConfigConflictEntry[]
+    revoked: ConfigDiffEntry[]
+  }
+}
+
+export interface ConfigSyncReport {
+  pulled: number
+  pushed: number
+  revoked: number
+  conflictsResolved: number
+  rejected: { path: string; reason: string }[]
+  lastSync: string
 }

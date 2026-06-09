@@ -101,6 +101,17 @@ const api: ElectronAPI = {
   syncDisconnect: (workspaceRoot: string) =>
     ipcRenderer.invoke("sync:disconnect", workspaceRoot),
   syncStatus: () => ipcRenderer.invoke("sync:status"),
+
+  // ─── Config (récupération sans IA) ───────────────────────────────────
+  // cf packages/desktop/src/main/config/ipc.ts + docs/CONFIG_FETCH_BUTTON_PLAN.md
+  configStatus: (projectDir?: string) => ipcRenderer.invoke("config:status", projectDir),
+  configPull: (projectDir: string) => ipcRenderer.invoke("config:pull", projectDir),
+  configPlan: (projectDir: string) => ipcRenderer.invoke("config:plan", projectDir),
+  configApply: (args: {
+    projectDir: string
+    resolutions?: Record<string, "local" | "remote">
+    deleteRevoked?: boolean
+  }) => ipcRenderer.invoke("config:apply", args),
 }
 
 contextBridge.exposeInMainWorld("api", api)
